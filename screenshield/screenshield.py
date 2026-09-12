@@ -198,32 +198,48 @@ def snap_polygon_to_lines(contour, approx, corner_margin_px=0.0, min_fit_pts=6, 
     return snapped.reshape(-1, 1, 2).astype(np.float32)
 
 
+def offset_filled_mask(filled, offset_x_px, offset_y_px):
+    """Signed Minkowski offset via an elliptical kernel: positive shrinks
+    inward (erosion, body inset), negative grows outward (dilation, --fit's
+    'bleed past the active area' case). A single scalar sign drives both
+    axes — mixed-sign per-axis isn't a case any caller needs: body inset is
+    always >=0, --fit is one signed scalar applied to both axes."""
+    kx = max(1, int(round(abs(offset_x_px))) * 2 + 1)
+    ky = max(1, int(round(abs(offset_y_px))) * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
+    if offset_x_px >= 0 and offset_y_px >= 0:
+        return cv2.erode(filled, kernel, iterations=1)
+    if offset_x_px <= 0 and offset_y_px <= 0:
+        return cv2.dilate(filled, kernel, iterations=1)
+    raise ValueError(f"mixed-sign offset not supported: ({offset_x_px}, {offset_y_px})")
+
+
 def derive_outline(contour, mask_shape, inset_x_px, inset_y_px, epsilon_frac=0.004):
-    """Fill contour, erode by (inset_x_px, inset_y_px), re-contour, simplify
-    (or fit circle/ellipse). The erosion kernel is itself elliptical/anisotropic
-    so inset_x and inset_y are honored independently — do not erode uniformly
-    and patch afterwards, that can't reproduce a non-uniform true inset."""
+    """Fill contour, offset by (inset_x_px, inset_y_px) — signed: positive
+    erodes/shrinks inward (body inset, or a negative --fit contracting into
+    a recess), negative dilates/grows outward (a positive --fit bleeding
+    past a screen) — re-contour, simplify (or fit circle/ellipse). The
+    kernel is itself elliptical/anisotropic so the x and y components are
+    honored independently — do not offset uniformly and patch afterwards,
+    that can't reproduce a non-uniform true offset."""
     filled = np.zeros(mask_shape, dtype=np.uint8)
     cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
 
-    kx = max(1, int(round(inset_x_px)) * 2 + 1)
-    ky = max(1, int(round(inset_y_px)) * 2 + 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
-    eroded = cv2.erode(filled, kernel, iterations=1)
+    offset = offset_filled_mask(filled, inset_x_px, inset_y_px)
 
-    eroded_contour = largest_external_contour(eroded, chain=cv2.CHAIN_APPROX_NONE)
-    if eroded_contour is None:
+    offset_contour = largest_external_contour(offset, chain=cv2.CHAIN_APPROX_NONE)
+    if offset_contour is None:
         return None, False
 
-    if is_near_circular(eroded_contour):
-        ellipse = cv2.fitEllipse(eroded_contour)
+    if is_near_circular(offset_contour):
+        ellipse = cv2.fitEllipse(offset_contour)
         return ellipse, True
 
-    perimeter = cv2.arcLength(eroded_contour, True)
+    perimeter = cv2.arcLength(offset_contour, True)
     epsilon = epsilon_frac * perimeter
-    approx = cv2.approxPolyDP(eroded_contour, epsilon, True)
-    corner_margin_px = 1.5 * max(inset_x_px, inset_y_px)
-    approx = snap_polygon_to_lines(eroded_contour, approx, corner_margin_px=corner_margin_px)
+    approx = cv2.approxPolyDP(offset_contour, epsilon, True)
+    corner_margin_px = 1.5 * max(abs(inset_x_px), abs(inset_y_px))
+    approx = snap_polygon_to_lines(offset_contour, approx, corner_margin_px=corner_margin_px)
     return approx, False
 
 
@@ -292,11 +308,123 @@ def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False):
     return result
 
 
+# --- Stage 4: --target screen / --target recess -----------------------------
+
+def find_active_region_contour(img, body_contour, mode):
+    """Largest coherent region inside the body that's visually distinct from
+    the surrounding bezel:
+
+    screen — bright OR saturated (a lit/colorful display), per spec: "the
+    largest coherent bright or saturated region inside the body contour."
+
+    recess — the opposite polarity: a sunken feature (camera lens, a
+    control knob) typically reads as a locally DARK/shadowed area rather
+    than bright, so this takes the low-brightness class instead. This mode
+    isn't in the original spec and has no reference device to validate
+    against — same honest caveat as --notches auto: best-effort, unproven
+    on real hardware, always check the debug image.
+
+    Both use Otsu on the relevant channel restricted to body pixels — the
+    same "let the histogram find the gap" principle as auto_tol and
+    --notches auto, rather than a fixed brightness constant.
+    """
+    body_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    cv2.drawContours(body_mask, [body_contour], -1, 255, thickness=cv2.FILLED)
+    body_idx = body_mask > 0
+    if not body_idx.any():
+        return None
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    v, s = hsv[..., 2], hsv[..., 1]
+
+    if mode == "screen":
+        activity = np.maximum(v, s)
+        thresh, _ = cv2.threshold(activity[body_idx].astype(np.uint8), 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        region_mask = ((activity > thresh) & body_idx).astype(np.uint8) * 255
+    elif mode == "recess":
+        thresh, _ = cv2.threshold(v[body_idx].astype(np.uint8), 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # cv2's Otsu convention pairs with THRESH_BINARY's "> thresh" bright
+        # class; the dark class is therefore "<= thresh", not "< thresh" —
+        # with a hard two-level image (e.g. exactly 10 vs 30) Otsu can place
+        # thresh exactly AT the dark class's own value, and "< thresh" then
+        # selects nothing at all.
+        region_mask = ((v <= thresh) & body_idx).astype(np.uint8) * 255
+    else:
+        raise ValueError(f"unknown target mode {mode!r}")
+
+    k = max(3, int(round(0.008 * max(img.shape[:2]))) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    region_mask = cv2.morphologyEx(region_mask, cv2.MORPH_CLOSE, kernel)
+    region_mask = cv2.morphologyEx(region_mask, cv2.MORPH_OPEN, kernel)
+
+    candidate = largest_external_contour(region_mask, chain=cv2.CHAIN_APPROX_NONE)
+    if candidate is None:
+        return None
+
+    # A screen/recess is a sub-region of the body (spec's own framing for
+    # screen mode). On a body with no real distinct feature — a uniform
+    # color, or a degenerate Otsu split on near-constant input — the
+    # "region" found can end up being almost the whole body, or a sliver of
+    # noise. Neither is a usable target; treat both as not found rather
+    # than silently returning a wrong answer.
+    body_area = float(body_idx.sum())
+    candidate_area = cv2.contourArea(candidate)
+    area_ratio = candidate_area / body_area if body_area > 0 else 0.0
+    if area_ratio > 0.9 or area_ratio < 0.005:
+        return None
+
+    return candidate
+
+
+def detect_target(img, tol, target, inset_x_pct=0.0, inset_y_pct=0.0, fit_pct=0.0):
+    """Body detection is always run first (needed for the bbox regardless of
+    target — canvas framing and sheet offsets are body-relative). For
+    target=='body' the returned outline is body_contour eroded by
+    inset_x_pct/inset_y_pct, exactly as detect_body already did. For
+    target in ('screen','recess') the outline instead comes from the
+    detected active region, offset by the SIGNED --fit percentage: positive
+    dilates outward (bleed past a screen onto the bezel), negative erodes
+    inward (contract to fit inside a recess) — see offset_filled_mask.
+    fit_pct is a single scalar applied against the active region's own
+    width/height (not the body's), same spirit as inset_x/inset_y being
+    percentages of the body's own width/height in body mode.
+    """
+    result = detect_body(img, tol, inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct)
+    if result is None or target == "body":
+        return result
+
+    active_contour = find_active_region_contour(img, result["body_contour"], target)
+    if active_contour is None:
+        result["target_found"] = False
+        return result
+
+    ax, ay, aw, ah = cv2.boundingRect(active_contour)
+    fit_x_px = (fit_pct / 100.0) * aw
+    fit_y_px = (fit_pct / 100.0) * ah
+    # derive_outline's offset is signed positive=erode/shrink; --fit's sign
+    # convention is positive=expand/bleed outward, so negate going in.
+    outline, is_circle = derive_outline(active_contour, result["mask"].shape[:2], -fit_x_px, -fit_y_px)
+    outline_pts = ellipse_to_points(outline) if is_circle else outline
+
+    result["target_found"] = True
+    result["active_region_contour"] = active_contour
+    result["active_region_bbox"] = (ax, ay, aw, ah)
+    result["fit_x_px"] = fit_x_px
+    result["fit_y_px"] = fit_y_px
+    result["outline"] = outline_pts
+    result["is_circle"] = is_circle
+    return result
+
+
 def draw_debug(img, result, notch_points=None):
     dbg = img.copy()
     cv2.drawContours(dbg, [result["body_contour"]], -1, (0, 0, 255), 2)  # red, BGR
+    if result.get("active_region_contour") is not None:
+        cv2.drawContours(dbg, [result["active_region_contour"]], -1, (255, 0, 255), 1)  # magenta: raw screen/recess region, pre-fit
     if result["outline"] is not None:
-        cv2.drawContours(dbg, [result["outline"].astype(np.int32)], -1, (255, 0, 0), 2)  # blue
+        cv2.drawContours(dbg, [result["outline"].astype(np.int32)], -1, (255, 0, 0), 2)  # blue: final protector outline (the "detected target")
     x, y, w, h = result["body_bbox"]
     cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 255, 255), 1)
     for pts in (notch_points or []):
@@ -892,18 +1020,30 @@ def process_image(path: Path, args):
         return
 
     inset_x_pct, inset_y_pct = resolve_inset_pct(args)
-    result = detect_body(img, tol=args.tol, inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct)
+    result = detect_target(img, tol=args.tol, target=args.target,
+                            inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct, fit_pct=args.fit)
     if result is None:
         print(f"skip {path}: no device found", file=sys.stderr)
+        return
+    if args.target != "body" and not result.get("target_found", True):
+        print(f"skip {path}: body found but no {args.target} region detected inside it "
+              f"(try --target body, or --debug to see why)", file=sys.stderr)
         return
 
     x, y, w, h = result["body_bbox"]
     shape = "circle/ellipse" if result["is_circle"] else f"{len(result['outline'])}-point polygon"
     tol_note = f"auto tol={result['tol_used']:.1f} (border p99={result['border_p99']:.1f})" if result["tol_auto"] \
         else f"fixed tol={result['tol_used']:.1f}"
-    print(f"{path.name}: body bbox {w}x{h}px at ({x},{y}); "
-          f"inset {result['inset_x_px']:.1f}x{result['inset_y_px']:.1f}px; "
-          f"protector outline: {shape}; {tol_note}")
+    if args.target == "body":
+        print(f"{path.name}: body bbox {w}x{h}px at ({x},{y}); "
+              f"inset {result['inset_x_px']:.1f}x{result['inset_y_px']:.1f}px; "
+              f"protector outline: {shape}; {tol_note}")
+    else:
+        ax, ay, aw, ah = result["active_region_bbox"]
+        print(f"{path.name}: body bbox {w}x{h}px at ({x},{y}); "
+              f"target={args.target} region {aw}x{ah}px at ({ax},{ay}); "
+              f"fit {result['fit_x_px']:+.1f}x{result['fit_y_px']:+.1f}px; "
+              f"protector outline: {shape}; {tol_note}")
 
     notches_pct = resolve_notches(args, img=img, result=result)
     if notches_pct:
@@ -946,8 +1086,11 @@ def build_parser():
     p = argparse.ArgumentParser(prog="screenshield")
     p.add_argument("input", type=Path, help="image file or folder")
     p.add_argument("--outdir", type=Path, default=Path("out"))
-    p.add_argument("--target", choices=["body", "screen"], default="body")
-    p.add_argument("--bleed", type=float, default=0.0)
+    p.add_argument("--target", choices=["body", "screen", "recess"], default="body")
+    p.add_argument("--fit", type=float, default=0.0,
+                    help="screen/recess only: signed %% of the detected active region's own "
+                         "width/height. Positive dilates outward (bleed past a screen onto "
+                         "the bezel); negative erodes inward (contract to fit inside a recess)")
     p.add_argument("--profile", type=Path, default=None)
     p.add_argument("--notch", nargs=4, type=float, action="append", default=None)
     p.add_argument("--pick", action="store_true")
@@ -974,10 +1117,6 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-
-    if args.target == "screen":
-        print("error: --target screen is not implemented yet (build stage 4)", file=sys.stderr)
-        return 1
 
     for path in collect_inputs(args.input):
         process_image(path, args)

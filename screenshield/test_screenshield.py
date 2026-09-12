@@ -698,6 +698,104 @@ def test_notches_auto_falls_back_to_brightness_without_cached_templates(tmp_path
     assert "template relocate" not in out
 
 
+# --- Stage 4: --target screen / --target recess, signed --fit ---------------
+
+def _synthetic_round_watch(body_r=150, active_r=100, bright=True,
+                            center=(220, 220), canvas=440):
+    """A round body (dark bezel) with a concentric round active region —
+    bright (screen-like) or dark (recess-like) — for exercising the
+    circle/ellipse-fitting branch, which the rectangular reference device
+    never touches."""
+    img = np.full((canvas, canvas, 3), 255, dtype=np.uint8)
+    cv2.circle(img, center, body_r, (30, 30, 30), -1)
+    color = (230, 200, 80) if bright else (10, 10, 10)
+    cv2.circle(img, center, active_r, color, -1)
+    return img
+
+
+def _outline_center_radius(outline):
+    pts = outline.reshape(-1, 2)
+    cx, cy = pts.mean(axis=0)
+    r = float(np.mean(np.linalg.norm(pts - [cx, cy], axis=1)))
+    return cx, cy, r
+
+
+def test_target_screen_stays_round_and_fit_zero_matches_region():
+    """Spec: 'a round watch crystal must stay round' — must fit an ellipse,
+    not force a low-vertex polygon. fit=0 should reproduce the detected
+    region's own radius (no offset)."""
+    img = _synthetic_round_watch(active_r=100, bright=True)
+    result = ss.detect_target(img, tol=None, target="screen", fit_pct=0.0)
+
+    assert result["target_found"] is True
+    assert result["is_circle"] is True
+    _, _, r = _outline_center_radius(result["outline"])
+    assert abs(r - 100) < 3
+
+
+def test_fit_sign_convention_positive_bleeds_negative_contracts():
+    """Positive --fit dilates outward past the detected region (bleed onto
+    the bezel, screen use case); negative erodes inward (contract to fit
+    inside, recess use case). Both signs measured against the SAME region
+    so only the sign/magnitude of --fit explains the radius change."""
+    img = _synthetic_round_watch(active_r=100, bright=True)
+
+    r0 = _outline_center_radius(ss.detect_target(img, tol=None, target="screen", fit_pct=0.0)["outline"])[2]
+    r_pos = _outline_center_radius(ss.detect_target(img, tol=None, target="screen", fit_pct=15.0)["outline"])[2]
+    r_neg = _outline_center_radius(ss.detect_target(img, tol=None, target="screen", fit_pct=-15.0)["outline"])[2]
+
+    assert r_pos > r0 > r_neg
+    # active region bbox width ~199px (diameter 200, minus AA/morphology
+    # slop) -> fit_x_px = 15% of that ~30px, added/subtracted directly to
+    # the radius by the dilate/erode kernel -> +-30px, roughly.
+    assert abs((r_pos - r0) - 30) < 6
+    assert abs((r0 - r_neg) - 30) < 6
+
+
+def test_target_recess_detects_dark_region_not_bright():
+    """recess is the opposite polarity from screen: a locally DARK region
+    inside the body (e.g. a sunken camera lens), not a bright one. This
+    also regression-guards the Otsu boundary bug found during development —
+    a hard two-level image (exactly 10 vs 30) put the Otsu threshold AT the
+    dark class's own value, and a strict '<' comparison found nothing."""
+    dark_img = _synthetic_round_watch(active_r=100, bright=False)
+    result = ss.detect_target(dark_img, tol=None, target="recess", fit_pct=0.0)
+    assert result["target_found"] is True
+    _, _, r = _outline_center_radius(result["outline"])
+    assert abs(r - 100) < 3
+
+    # and screen mode must NOT find this same dark region (wrong polarity)
+    result_wrong_mode = ss.detect_target(dark_img, tol=None, target="screen", fit_pct=0.0)
+    if result_wrong_mode["target_found"]:
+        _, _, r_wrong = _outline_center_radius(result_wrong_mode["outline"])
+        assert abs(r_wrong - 100) > 20  # did not find the same 100px recess
+
+
+def test_target_screen_not_found_on_uniform_body():
+    """A body with no actual distinct screen/recess feature (uniform color)
+    must report target_found=False, not silently return the whole body (or
+    a noise speck) as if it were a legitimate detection."""
+    uniform = np.full((300, 300, 3), 255, dtype=np.uint8)
+    cv2.circle(uniform, (150, 150), 100, (30, 30, 30), -1)
+    result = ss.detect_target(uniform, tol=None, target="screen", fit_pct=0.0)
+    assert result is not None  # body itself was still found
+    assert result.get("target_found") is False
+
+
+def test_target_body_mode_unaffected_by_detect_target_refactor():
+    """detect_target(target='body') must behave identically to the
+    original detect_body — this is a regression guard for the refactor
+    that generalized derive_outline to a signed offset."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    via_detect_body = ss.detect_body(img, tol=None, inset_x_pct=DEFAULT_INSET_X_PCT,
+                                      inset_y_pct=DEFAULT_INSET_Y_PCT)
+    via_detect_target = ss.detect_target(img, tol=None, target="body",
+                                          inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT)
+    assert via_detect_body["body_bbox"] == via_detect_target["body_bbox"]
+    np.testing.assert_array_equal(via_detect_body["outline"], via_detect_target["outline"])
+    assert via_detect_body["is_circle"] == via_detect_target["is_circle"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
