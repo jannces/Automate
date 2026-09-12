@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import cv2
@@ -794,6 +795,84 @@ def test_target_body_mode_unaffected_by_detect_target_refactor():
     assert via_detect_body["body_bbox"] == via_detect_target["body_bbox"]
     np.testing.assert_array_equal(via_detect_body["outline"], via_detect_target["outline"])
     assert via_detect_body["is_circle"] == via_detect_target["is_circle"]
+
+
+# --- Stage 5: SVG export -----------------------------------------------------
+
+def test_svg_matches_png_layout_exactly():
+    """SVG path coordinates must come from the exact same geometry as the
+    PNG (spec: 'SVG coordinates must match the PNG output exactly') — parse
+    the emitted path data back out and compare against the layout dict
+    render_outputs uses for the raster, point for point, not just eyeball
+    it. Also checks the required two-layer structure and one compound path
+    per sheet with cutouts included as extra subpaths."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    profile_path = Path(__file__).parent / "profiles" / "chigee_test.json"
+    args = ss.build_parser().parse_args(
+        [str(CLEAN_DEVICE), "--profile", str(profile_path), "--svg"])
+
+    result = ss.detect_target(img, tol=args.tol, target=args.target,
+                               inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT,
+                               fit_pct=args.fit)
+    notches_pct = ss.resolve_notches(args, img=img, result=result)
+    layout = ss.compute_layout(result, args, notches_pct)
+    svg_text = ss.render_svg(layout, args.size, args.copies)
+
+    assert svg_text.count('<g id="protector_1x">') == 1
+    assert svg_text.count('<g id="protector_3x">') == 1
+    assert svg_text.count("<path") == 1 + args.copies  # one in 1x layer, one per sheet in 3x layer
+    assert f'width="{args.size}"' in svg_text and f'height="{args.size}"' in svg_text
+    assert 'fill-rule="evenodd"' in svg_text
+    assert len(notches_pct) == 2  # sanity: the profile's real cutouts loaded, so holes are exercised below
+
+    all_paths_d = re.findall(r'<path d="([^"]+)"', svg_text)
+    assert len(all_paths_d) == 1 + args.copies
+
+    def parse_points(d):
+        return [(float(x), float(y)) for x, y in re.findall(r"(-?\d+\.\d+),(-?\d+\.\d+)", d)]
+
+    def expected_points(sheet_index):
+        outline = layout["sheet_outlines_px"][sheet_index].reshape(-1, 2)
+        notches = [n.reshape(-1, 2) for n in layout["sheet_notches_px"][sheet_index]]
+        return np.vstack([outline] + notches) if notches else outline
+
+    # path 0 = the 1x layer's single sheet (sheet 0)
+    svg_pts = parse_points(all_paths_d[0])
+    expected = expected_points(0)
+    assert len(svg_pts) == len(expected)
+    for (sx, sy), (ex, ey) in zip(svg_pts, expected):
+        assert abs(sx - ex) < 0.02
+        assert abs(sy - ey) < 0.02
+
+    # paths 1..copies = the 3x layer's sheets, in order
+    for i in range(args.copies):
+        svg_pts = parse_points(all_paths_d[1 + i])
+        expected = expected_points(i)
+        assert len(svg_pts) == len(expected)
+        for (sx, sy), (ex, ey) in zip(svg_pts, expected):
+            assert abs(sx - ex) < 0.02
+            assert abs(sy - ey) < 0.02
+
+
+def test_svg_written_only_with_flag(tmp_path):
+    """--svg is opt-in — no .svg file without it."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    args = ss.build_parser().parse_args([str(CLEAN_DEVICE), "--outdir", str(tmp_path)])
+    assert args.svg is False
+    ss.process_image(CLEAN_DEVICE, args)
+    assert not any(tmp_path.glob("*.svg"))
+    assert any(tmp_path.glob("*_1x.png"))  # sanity: it did actually run
+
+
+def test_compound_path_holes_are_evenodd_subpaths():
+    """A notch hole must be its own closed subpath (separate 'M...Z'), not
+    merged into the outer outline's point list — that's what makes
+    fill-rule=evenodd treat it as a hole."""
+    outline = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float64).reshape(-1, 1, 2)
+    notch = np.array([[10, 10], [20, 10], [20, 20], [10, 20]], dtype=np.float64).reshape(-1, 1, 2)
+    d = ss.compound_path_d(outline, [notch])
+    assert d.count("M") == 2
+    assert d.count("Z") == 2
 
 
 if __name__ == "__main__":

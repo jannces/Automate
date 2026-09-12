@@ -973,10 +973,18 @@ def resolve_layer_alphas(args, copies):
     raise ValueError(f"--layer-alpha required when --copies != 3 (no default for {copies} sheets)")
 
 
-def render_outputs(img, result, args, notches_pct=None):
-    """Renders both outputs off the SAME canvas transform (framed on the
-    3-sheet extent), per spec: the device must land identically in both
-    files, not be framed independently. Returns (img_1x, img_3x) uint8."""
+def compute_layout(result, args, notches_pct=None):
+    """Geometry shared by PNG and SVG output — computed exactly once so the
+    two representations can never diverge (spec: 'SVG coordinates must
+    match the PNG output exactly'). Framed on the 3-sheet extent, per spec:
+    the device must land identically in both PNG files, not be framed
+    independently — same scale/tx/ty reused for every sheet and for SVG.
+
+    Returns a dict: scale/tx/ty, per-sheet canvas-space outline points
+    (sheet_outlines_px[i]) and per-sheet canvas-space notch hole points
+    (sheet_notches_px[i], one list of point-arrays per sheet), and the
+    canvas-space stroke width.
+    """
     body_w, body_h = result["body_bbox"][2], result["body_bbox"][3]
     base_outline = result["outline"]
     copies = args.copies
@@ -985,32 +993,110 @@ def render_outputs(img, result, args, notches_pct=None):
     content_bbox = compute_content_bbox(result["body_bbox"], outlines)
     scale, tx, ty = compute_canvas_transform(content_bbox, args.size, margin_pct=4.0)
     stroke_width_px = STROKE_WIDTH_AT_1500 * (args.size / 1500.0)
-    layer_alphas = resolve_layer_alphas(args, copies)
-
-    base_canvas = place_image_on_canvas(img, scale, tx, ty, args.size)
 
     base_notch_points = [notch_pct_to_points(n, result["body_bbox"]) for n in (notches_pct or [])]
     ox, oy = sheet_offset_px(body_w, body_h, tuple(args.offset))
     sx, sy = sheet_offset_px(body_w, body_h, tuple(args.step))
 
-    def sheet_notch_rects(i):
+    sheet_outlines_px, sheet_notches_px = [], []
+    for i in range(copies):
+        sheet_outlines_px.append(transform_outline(outlines[i], scale, tx, ty))
         dx, dy = ox + i * sx, oy + i * sy
-        return [transform_outline(translate_outline(pts, dx, dy), scale, tx, ty)
-                for pts in base_notch_points]
+        sheet_notches_px.append([transform_outline(translate_outline(pts, dx, dy), scale, tx, ty)
+                                  for pts in base_notch_points])
+
+    return {
+        "scale": scale, "tx": tx, "ty": ty,
+        "stroke_width_px": stroke_width_px,
+        "sheet_outlines_px": sheet_outlines_px,
+        "sheet_notches_px": sheet_notches_px,
+    }
+
+
+def render_outputs(img, result, args, notches_pct=None, layout=None):
+    """Renders both PNG outputs off the SAME layout (see compute_layout),
+    per spec: the device must land identically in both files, not be framed
+    independently. Returns (img_1x, img_3x) uint8."""
+    if layout is None:
+        layout = compute_layout(result, args, notches_pct)
+    scale, tx, ty = layout["scale"], layout["tx"], layout["ty"]
+    stroke_width_px = layout["stroke_width_px"]
+    copies = args.copies
+    layer_alphas = resolve_layer_alphas(args, copies)
+
+    base_canvas = place_image_on_canvas(img, scale, tx, ty, args.size)
 
     canvas_1x = base_canvas.astype(np.float64)
-    sheet1_px = transform_outline(outlines[0], scale, tx, ty)
-    render_sheet(canvas_1x, sheet1_px, args.style_alpha, layer_alpha=1.0,
-                 stroke_width_px=stroke_width_px, notch_rects_px=sheet_notch_rects(0))
+    render_sheet(canvas_1x, layout["sheet_outlines_px"][0], args.style_alpha, layer_alpha=1.0,
+                 stroke_width_px=stroke_width_px, notch_rects_px=layout["sheet_notches_px"][0])
 
     canvas_3x = base_canvas.astype(np.float64)
     for i in range(copies):
-        outline_px = transform_outline(outlines[i], scale, tx, ty)
+        outline_px = layout["sheet_outlines_px"][i]
         render_sheet(canvas_3x, outline_px, args.style_alpha, layer_alphas[i],
-                     stroke_width_px=stroke_width_px, notch_rects_px=sheet_notch_rects(i))
+                     stroke_width_px=stroke_width_px, notch_rects_px=layout["sheet_notches_px"][i])
 
     return (np.clip(canvas_1x, 0, 255).astype(np.uint8),
             np.clip(canvas_3x, 0, 255).astype(np.uint8))
+
+
+# --- Stage 5: SVG export -----------------------------------------------------
+
+def points_to_svg_subpath(points):
+    """One closed SVG path subpath ('M x,y L x,y ... Z') from an (N,1,2)
+    point array — used both for the outer outline and for each notch hole,
+    so a compound path is just these strings concatenated (see
+    compound_path_d)."""
+    pts = points.reshape(-1, 2)
+    if len(pts) == 0:
+        return ""
+    d = f"M {pts[0][0]:.2f},{pts[0][1]:.2f}"
+    for x, y in pts[1:]:
+        d += f" L {x:.2f},{y:.2f}"
+    return d + " Z"
+
+
+def compound_path_d(outline_points, notch_points_list):
+    """Outer outline plus each notch as its own closed subpath, in one path
+    'd' string. fill-rule=evenodd (set by the caller) turns the notch
+    subpaths into holes regardless of winding direction — this is what
+    spec's 'compound paths with cutouts as even-odd holes' means."""
+    subpaths = [points_to_svg_subpath(outline_points)]
+    subpaths.extend(points_to_svg_subpath(n) for n in notch_points_list)
+    return " ".join(subpaths)
+
+
+def render_svg(layout, size, copies):
+    """One SVG with two named layers/groups, protector_1x and protector_3x,
+    each holding one compound path per sheet — coordinates come from the
+    exact same layout dict compute_layout produces for the PNG raster, so
+    they can't diverge (spec: 'SVG coordinates must match the PNG output
+    exactly').
+
+    Fill/stroke here are just enough to make the shapes visible on open —
+    this is meant as an Illustrator escape hatch (spec): select the sheets
+    there and apply Graphic Style 4 for the real appearance, don't rely on
+    this file's own paint.
+    """
+    stroke_w = layout["stroke_width_px"]
+
+    def sheet_path(i):
+        d = compound_path_d(layout["sheet_outlines_px"][i], layout["sheet_notches_px"][i])
+        return (f'    <path d="{d}" fill-rule="evenodd" fill="#ffffff" fill-opacity="0.5" '
+                f'stroke="#a4a4a4" stroke-width="{stroke_w:.2f}"/>')
+
+    layer_1x = '  <g id="protector_1x">\n' + sheet_path(0) + '\n  </g>'
+    layer_3x = ('  <g id="protector_3x">\n'
+                + "\n".join(sheet_path(i) for i in range(copies))
+                + '\n  </g>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+        f'viewBox="0 0 {size} {size}">\n'
+        f'{layer_1x}\n{layer_3x}\n'
+        '</svg>\n'
+    )
 
 
 def process_image(path: Path, args):
@@ -1057,7 +1143,8 @@ def process_image(path: Path, args):
         cv2.imwrite(str(out_path), dbg)
         print(f"  wrote {out_path}")
 
-    img_1x, img_3x = render_outputs(img, result, args, notches_pct)
+    layout = compute_layout(result, args, notches_pct)
+    img_1x, img_3x = render_outputs(img, result, args, notches_pct, layout=layout)
     args.outdir.mkdir(parents=True, exist_ok=True)
     path_1x = args.outdir / f"{path.stem}_1x.png"
     path_3x = args.outdir / f"{path.stem}_3x.png"
@@ -1065,6 +1152,12 @@ def process_image(path: Path, args):
     cv2.imwrite(str(path_3x), img_3x)
     print(f"  wrote {path_1x}")
     print(f"  wrote {path_3x}")
+
+    if args.svg:
+        svg_text = render_svg(layout, args.size, args.copies)
+        svg_path = args.outdir / f"{path.stem}.svg"
+        svg_path.write_text(svg_text, encoding="utf-8")
+        print(f"  wrote {svg_path}")
 
 
 def resolve_inset_pct(args):
