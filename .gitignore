@@ -1,0 +1,5 @@
+screenshield/out/
+screenshield/input/
+__pycache__/
+*.pyc
+.venv/
