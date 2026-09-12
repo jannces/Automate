@@ -510,6 +510,194 @@ def test_notches_auto_report_counts_are_consistent():
     assert len(notches) == report["kept"]
 
 
+# --- Stage 3: --notches auto, template relocation (better than brightness) --
+
+def _checker_patch(size=(16, 20), c1=(40, 180, 230), c2=(230, 60, 40)):
+    """A small distinctive 2x2 checkerboard patch — enough texture that
+    template matching can't just latch onto a flat color anywhere."""
+    h, w = size
+    patch = np.zeros((h, w, 3), dtype=np.uint8)
+    patch[: h // 2, : w // 2] = c1
+    patch[h // 2:, w // 2:] = c1
+    patch[: h // 2, w // 2:] = c2
+    patch[h // 2:, : w // 2] = c2
+    return patch
+
+
+def _synthetic_capture(body_bbox, notch_rect_px, canvas_size=(300, 400)):
+    """A synthetic 'photo': body_bbox on a black canvas with a distinctive
+    checker patch stamped at notch_rect_px (device-space pixels)."""
+    h, w = canvas_size
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    nx, ny, nw, nh = notch_rect_px
+    img[ny:ny + nh, nx:nx + nw] = _checker_patch((nh, nw))
+    return img
+
+
+def test_relocate_by_template_finds_shifted_notch():
+    """Cache a template from one synthetic photo, shift the same marker by
+    a few px in a second synthetic photo (simulating 'position shifted
+    slightly'), and confirm relocate finds the NEW position with a
+    confident score — not just repeats the old profile-predicted one."""
+    body_bbox = (50, 50, 300, 200)
+    original_rect = (150, 120, 20, 16)  # nx, ny, nw, nh — device px
+
+    captured_img = _synthetic_capture(body_bbox, original_rect)
+    notch_points = np.array(
+        [[original_rect[0], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1] + original_rect[3]],
+         [original_rect[0], original_rect[1] + original_rect[3]]],
+        dtype=np.float64).reshape(-1, 1, 2)
+    cached_notch = ss.notch_points_to_pct(notch_points, body_bbox)
+    ss.attach_notch_templates([cached_notch], captured_img, body_bbox)
+    assert cached_notch.get("template_png_b64")
+
+    shifted_rect = (158, 113, 20, 16)  # shifted +8, -7
+    new_img = _synthetic_capture(body_bbox, shifted_rect)
+
+    notches, report = ss.relocate_notches_by_template(new_img, body_bbox, [cached_notch])
+
+    assert report["matched"] == 1
+    assert report["low_confidence"] == 0
+    assert report["scores"][0] > 0.9  # near-exact pixel match, should be very confident
+
+    relocated_points = ss.notch_pct_to_points(notches[0], body_bbox)
+    rx0, ry0, rx1, ry1 = ss.outline_bounds(relocated_points)
+    assert abs(rx0 - shifted_rect[0]) <= 1
+    assert abs(ry0 - shifted_rect[1]) <= 1
+    assert abs((rx1 - rx0) - shifted_rect[2]) <= 1
+    assert abs((ry1 - ry0) - shifted_rect[3]) <= 1
+
+
+def test_relocate_by_template_low_confidence_keeps_profile_position():
+    """If the cached marker is nowhere near the search window in the new
+    photo (e.g. the cutout genuinely isn't there), relocation must not
+    invent a confident-looking wrong answer — it should report low
+    confidence and fall back to the profile's percentage-predicted
+    position rather than the unrelated best-available match."""
+    body_bbox = (50, 50, 300, 200)
+    original_rect = (150, 120, 20, 16)
+
+    captured_img = _synthetic_capture(body_bbox, original_rect)
+    notch_points = np.array(
+        [[original_rect[0], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1] + original_rect[3]],
+         [original_rect[0], original_rect[1] + original_rect[3]]],
+        dtype=np.float64).reshape(-1, 1, 2)
+    cached_notch = ss.notch_points_to_pct(notch_points, body_bbox)
+    ss.attach_notch_templates([cached_notch], captured_img, body_bbox)
+
+    blank_img = np.zeros((300, 400, 3), dtype=np.uint8)  # marker absent entirely
+    notches, report = ss.relocate_notches_by_template(blank_img, body_bbox, [cached_notch])
+
+    assert report["matched"] == 0
+    assert report["low_confidence"] == 1
+    # falls back to the original profile position, unchanged
+    assert abs(notches[0]["x_pct"] - cached_notch["x_pct"]) < 1e-9
+    assert abs(notches[0]["y_pct"] - cached_notch["y_pct"]) < 1e-9
+
+
+def test_relocate_by_template_scales_with_body_size():
+    """A later photo of the same model at a different resolution/crop —
+    the captured body size differs from the current one — must scale the
+    cached template by that ratio before matching, not assume identical
+    pixel scale."""
+    capture_body_bbox = (50, 50, 300, 200)
+    original_rect = (150, 120, 20, 16)
+    captured_img = _synthetic_capture(capture_body_bbox, original_rect)
+    notch_points = np.array(
+        [[original_rect[0], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1] + original_rect[3]],
+         [original_rect[0], original_rect[1] + original_rect[3]]],
+        dtype=np.float64).reshape(-1, 1, 2)
+    cached_notch = ss.notch_points_to_pct(notch_points, capture_body_bbox)
+    ss.attach_notch_templates([cached_notch], captured_img, capture_body_bbox)
+
+    # new photo: everything scaled up 2x (bigger body, bigger canvas)
+    new_body_bbox = (100, 100, 600, 400)
+    new_rect = (300, 240, 40, 32)  # same relative position/size, 2x scale
+    new_img = _synthetic_capture(new_body_bbox, new_rect, canvas_size=(600, 800))
+
+    notches, report = ss.relocate_notches_by_template(new_img, new_body_bbox, [cached_notch])
+
+    assert report["matched"] == 1
+    relocated_points = ss.notch_pct_to_points(notches[0], new_body_bbox)
+    rx0, ry0, rx1, ry1 = ss.outline_bounds(relocated_points)
+    assert abs(rx0 - new_rect[0]) <= 2
+    assert abs(ry0 - new_rect[1]) <= 2
+    assert abs((rx1 - rx0) - new_rect[2]) <= 2
+    assert abs((ry1 - ry0) - new_rect[3]) <= 2
+
+
+def test_notches_auto_uses_template_relocation_when_available(tmp_path, capsys):
+    """resolve_notches('auto') must prefer template relocation over the
+    brightness heuristic when the profile has cached templates."""
+    body_bbox = (50, 50, 300, 200)
+    original_rect = (150, 120, 20, 16)
+    captured_img = _synthetic_capture(body_bbox, original_rect)
+    notch_points = np.array(
+        [[original_rect[0], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1]],
+         [original_rect[0] + original_rect[2], original_rect[1] + original_rect[3]],
+         [original_rect[0], original_rect[1] + original_rect[3]]],
+        dtype=np.float64).reshape(-1, 1, 2)
+    cached_notch = ss.notch_points_to_pct(notch_points, body_bbox)
+    ss.attach_notch_templates([cached_notch], captured_img, body_bbox)
+
+    profile_path = tmp_path / "device.json"
+    ss.save_profile(profile_path, {"notches": [cached_notch]})
+
+    shifted_rect = (152, 118, 20, 16)
+    new_img = _synthetic_capture(body_bbox, shifted_rect)
+
+    class FakeResult(dict):
+        pass
+
+    result = {"body_bbox": body_bbox, "body_contour": np.array(
+        [[[50, 50]], [[350, 50]], [[350, 250]], [[50, 250]]], dtype=np.int32)}
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "auto"
+    args.notch = None
+    args.profile = profile_path
+    args.pick = False
+
+    notches = ss.resolve_notches(args, img=new_img, result=result)
+    out = capsys.readouterr().out.lower()
+
+    assert "template relocate" in out
+    assert "brightness" not in out.split("no cached")[0]  # brightness fallback text not used
+    assert len(notches) == 1
+
+
+def test_notches_auto_falls_back_to_brightness_without_cached_templates(tmp_path, capsys):
+    """No profile, or a profile with no cached templates, must fall back to
+    the original brightness heuristic exactly as before — it's the
+    fallback, not replaced."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    result = ss.detect_body(img, tol=None, inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT)
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "auto"
+    args.notch = None
+    args.profile = None
+    args.pick = False
+
+    ss.resolve_notches(args, img=img, result=result)
+    out = capsys.readouterr().out.lower()
+    assert "brightness fallback" in out
+    assert "template relocate" not in out
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

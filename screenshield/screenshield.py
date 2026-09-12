@@ -4,6 +4,7 @@
 Stage 1: body detection and outline derivation (--debug only).
 """
 import argparse
+import base64
 import json
 import sys
 from pathlib import Path
@@ -491,6 +492,146 @@ def notch_points_to_pct(points, body_bbox):
     }
 
 
+TEMPLATE_MARGIN_FRAC = 0.15
+
+
+def crop_notch_template(img, notch_points, margin_frac=TEMPLATE_MARGIN_FRAC):
+    """Small image patch around a notch (with a margin for match context),
+    to be cached in the profile and later relocated by template matching on
+    a new shot of the same/similar model."""
+    x0, y0, x1, y1 = outline_bounds(notch_points)
+    w, h = x1 - x0, y1 - y0
+    mx, my = w * margin_frac, h * margin_frac
+    ih, iw = img.shape[:2]
+    px0, py0 = max(0, int(round(x0 - mx))), max(0, int(round(y0 - my)))
+    px1, py1 = min(iw, int(round(x1 + mx))), min(ih, int(round(y1 + my)))
+    return img[py0:py1, px0:px1]
+
+
+def encode_template(patch):
+    if patch is None or patch.size == 0:
+        return None
+    ok, buf = cv2.imencode(".png", patch)
+    return base64.b64encode(buf).decode("ascii") if ok else None
+
+
+def decode_template(b64):
+    if not b64:
+        return None
+    buf = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+def attach_notch_templates(notches_pct, img, body_bbox):
+    """Adds a cached template patch to each notch dict, plus the body size
+    it was captured against (needed to scale the template if a later photo
+    has the device at a different pixel size). Mutates and returns the same
+    list of dicts."""
+    _, _, body_w, body_h = body_bbox
+    for notch in notches_pct:
+        points = notch_pct_to_points(notch, body_bbox)
+        patch = crop_notch_template(img, points)
+        b64 = encode_template(patch)
+        if b64:
+            notch["template_png_b64"] = b64
+            notch["template_margin_frac"] = TEMPLATE_MARGIN_FRAC
+            notch["captured_body_w"] = body_w
+            notch["captured_body_h"] = body_h
+    return notches_pct
+
+
+def relocate_notches_by_template(img, body_bbox, cached_notches,
+                                  search_margin_factor=1.0, min_match_score=0.6):
+    """Relocate cached notches (with template patches from a prior --notch
+    or --pick run) on a new photo, instead of searching the whole frame for
+    unknown features. Each template is scaled by the ratio of the new
+    body's size to the size it was captured against, then matched only
+    within a small window around where the profile's percentage position
+    predicts it should be — this is what makes it tractable where the
+    brightness heuristic isn't: it's relocating a known thing, not
+    discovering an unknown one.
+
+    Returns (notches_pct, report). For a notch whose template doesn't match
+    confidently, the profile's percentage-predicted position is used as-is
+    (still a reasonable answer) and flagged in the report rather than
+    dropped or handed off to the unrelated brightness scan.
+    """
+    bx, by, bw, bh = body_bbox
+    notches_pct = []
+    matched, low_confidence, no_template = 0, 0, 0
+    scores = []
+
+    for cached in cached_notches:
+        b64 = cached.get("template_png_b64")
+        template = decode_template(b64)
+        cap_w = cached.get("captured_body_w")
+        cap_h = cached.get("captured_body_h")
+        margin_frac = cached.get("template_margin_frac", TEMPLATE_MARGIN_FRAC)
+
+        if template is None or not cap_w or not cap_h:
+            no_template += 1
+            notches_pct.append({k: cached[k] for k in ("x_pct", "y_pct", "w_pct", "h_pct")})
+            continue
+
+        rx, ry = bw / cap_w, bh / cap_h
+        th0, tw0 = template.shape[:2]
+        new_tw, new_th = max(1, round(tw0 * rx)), max(1, round(th0 * ry))
+        template_scaled = cv2.resize(template, (new_tw, new_th), interpolation=cv2.INTER_LINEAR)
+
+        expected_points = notch_pct_to_points(cached, body_bbox)
+        ex0, ey0, ex1, ey1 = outline_bounds(expected_points)
+        # expected rect is the un-padded notch; the template includes the
+        # margin, so the search window needs the same margin plus slack.
+        ew, eh = ex1 - ex0, ey1 - ey0
+        pad_x, pad_y = ew * margin_frac, eh * margin_frac
+        slack_x, slack_y = new_tw * search_margin_factor, new_th * search_margin_factor
+
+        ih, iw = img.shape[:2]
+        sx0 = max(0, int(round(ex0 - pad_x - slack_x)))
+        sy0 = max(0, int(round(ey0 - pad_y - slack_y)))
+        sx1 = min(iw, int(round(ex1 + pad_x + slack_x)))
+        sy1 = min(ih, int(round(ey1 + pad_y + slack_y)))
+        search_region = img[sy0:sy1, sx0:sx1]
+
+        if search_region.shape[0] < new_th or search_region.shape[1] < new_tw:
+            low_confidence += 1
+            scores.append(0.0)
+            notches_pct.append({k: cached[k] for k in ("x_pct", "y_pct", "w_pct", "h_pct")})
+            continue
+
+        result_map = cv2.matchTemplate(search_region, template_scaled, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result_map)
+        scores.append(float(max_val))
+
+        if max_val < min_match_score:
+            low_confidence += 1
+            notches_pct.append({k: cached[k] for k in ("x_pct", "y_pct", "w_pct", "h_pct")})
+            continue
+
+        # matched top-left of the (padded) template, in image coords -> the
+        # notch itself sits inset by the padding within that template.
+        notch_w_in_template = new_tw / (1 + 2 * margin_frac)
+        notch_h_in_template = new_th / (1 + 2 * margin_frac)
+        inset_x = (new_tw - notch_w_in_template) / 2.0
+        inset_y = (new_th - notch_h_in_template) / 2.0
+        nx0 = sx0 + max_loc[0] + inset_x
+        ny0 = sy0 + max_loc[1] + inset_y
+        points = np.array([[nx0, ny0], [nx0 + notch_w_in_template, ny0],
+                            [nx0 + notch_w_in_template, ny0 + notch_h_in_template],
+                            [nx0, ny0 + notch_h_in_template]],
+                           dtype=np.float64).reshape(-1, 1, 2)
+        matched += 1
+        notches_pct.append(notch_points_to_pct(points, body_bbox))
+
+    report = {
+        "matched": matched,
+        "low_confidence": low_confidence,
+        "no_template": no_template,
+        "scores": scores,
+    }
+    return notches_pct, report
+
+
 def load_profile(path):
     if path is None or not Path(path).exists():
         return {"notches": []}
@@ -550,6 +691,7 @@ def pick_notches(img, body_bbox, profile_path=None, max_display=900):
     cv2.destroyAllWindows()
 
     notches = rois_to_notches_pct(rois, display_scale, body_bbox)
+    attach_notch_templates(notches, img, body_bbox)
     if profile_path:
         profile = load_profile(profile_path)
         profile["notches"] = notches
@@ -649,6 +791,8 @@ def resolve_notches(args, img=None, result=None):
 
     if args.notch:
         notches = [{"x_pct": x, "y_pct": y, "w_pct": w, "h_pct": h} for x, y, w, h in args.notch]
+        if img is not None and result is not None:
+            attach_notch_templates(notches, img, result["body_bbox"])
         if args.profile:
             profile = load_profile(args.profile)
             profile["notches"] = notches
@@ -662,13 +806,29 @@ def resolve_notches(args, img=None, result=None):
         return []
 
     if args.notches == "auto":
+        cached = load_profile(args.profile).get("notches", []) if args.profile else []
+        cached_with_templates = [n for n in cached if n.get("template_png_b64")]
+
+        if cached_with_templates:
+            notches, report = relocate_notches_by_template(img, result["body_bbox"], cached_with_templates)
+            scores_str = ", ".join(f"{s:.2f}" for s in report["scores"])
+            print(f"  auto (template relocate): {report['matched']} matched confidently, "
+                  f"{report['low_confidence']} low-confidence (kept profile position), "
+                  f"{report['no_template']} had no cached template — scores: [{scores_str}]")
+            if report["low_confidence"]:
+                print("  WARNING: some cached cutouts did not relocate confidently — "
+                      "check the debug image before trusting this on a batch.")
+            return notches
+
         notches, report = detect_notches_auto(img, result["body_contour"], result["body_bbox"])
         print("  WARNING: --notches auto is best-effort and known to produce false "
               "positives from on-screen UI — check the debug image (green boxes) "
-              "before trusting this on a batch.")
-        print(f"  auto-detect: {report['found']} raw candidate(s) after removing the "
-              f"screen region, {report['rejected_area']} rejected by area filter "
-              f"(0.05%-5% of body area), {report['kept']} kept")
+              "before trusting this on a batch. (No cached notch templates found in "
+              "--profile to relocate instead — define cutouts once via --notch or "
+              "--pick and this will use template relocation on the next shot.)")
+        print(f"  auto-detect (brightness fallback): {report['found']} raw candidate(s) "
+              f"after removing the screen region, {report['rejected_area']} rejected by "
+              f"area filter (0.05%-5% of body area), {report['kept']} kept")
         return notches
 
     return []
