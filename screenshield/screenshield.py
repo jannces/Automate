@@ -434,19 +434,36 @@ def draw_debug(img, result, notch_points=None):
 
 # --- Stage 2: compositing, opacity model, canvas framing -------------------
 
-# Measured directly from ref_1x.jpg, not the naive CMYK->RGB conversion of
-# the .ai stroke (~#677A7B — far too dark/saturated for what a 1pt stroke
-# anti-aliases down to at this scale). Two independent clean crossings over
-# white background: a vertical edge landed the stroke's peak darkness in a
-# single row (255->151), a horizontal edge split it evenly across two rows
-# (255->186, 255->187). Summed "ink deficit" (255-pixel) matches almost
-# exactly between the two (137 vs 137), confirming both are the same
-# underlying anti-aliased stroke at different sub-pixel phase. Integrating
-# that deficit over the spec's ~1.5px stroke width gives the true color:
-# 255 - 137/1.5 ~= 164 (#A4A4A4) — lands centered in the spec's own #98-#B0
-# estimate.
-STROKE_COLOR_RGB = (164, 164, 164)
-STROKE_WIDTH_AT_1500 = 1.5
+# Width and color measured directly from ref_1x.jpg TOGETHER, as a coupled
+# pair — not the .ai file's naive CMYK->RGB conversion (~#677A7B, far too
+# dark/saturated for what a 1pt stroke anti-aliases down to at this scale),
+# and not spec's stated "~1.5px" taken on faith either. Solved from two
+# invariants:
+#
+# 1. Total ink deficit (sum of 255-pixel across a full perpendicular
+#    crossing) equals width * true_full_coverage_deficit (D), and is
+#    INVARIANT to sub-pixel phase. Two independent clean axis-aligned
+#    crossings over white background agree almost exactly: a vertical edge
+#    (255->222, 255->151) sums to 137; a horizontal edge (255->186,
+#    255->187) also sums to 137.
+# 2. The vertical edge's peak pixel (151, deficit 104) is the darkest pixel
+#    found at any clean axis-aligned crossing (checked at 3 widely
+#    separated points along each edge, always identical — not JPEG noise).
+#    No pixel's deficit can exceed D, so this alone proves D >= 104, which
+#    already rules out the ~91 a 1.5px-width assumption implies. Taking
+#    this peak as at-or-near saturation (D=104) and combining it with the
+#    invariant total (137) pins BOTH unknowns as one solve, not two
+#    separate guesses: W = total/D = 137/104 ~= 1.317px,
+#    color = 255 - D = 255 - 104 = 151 (#979797).
+#
+# 151 lands almost exactly on the LOWER edge of the spec's own independent
+# eyeballed estimate (#98-#B0, i.e. 152-176) rather than mid-range, which
+# the old width-assumed 164 did. Width and color must be changed together:
+# shipping 151 with the old 1.5px width reproduces a total ink deficit of
+# ~161 at this color, not the reference's measured 137 — verified by
+# rendering and re-sampling the actual composite (see CLAUDE.md).
+STROKE_COLOR_RGB = (151, 151, 151)
+STROKE_WIDTH_AT_1500 = 1.317
 
 
 def composite_alpha(effective_alphas):
@@ -544,7 +561,7 @@ def place_image_on_canvas(img, scale, tx, ty, canvas_size, bg_color=(255, 255, 2
     return canvas
 
 
-def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=4):
+def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=32):
     """Anti-aliased stroke coverage in [0,1] at a true sub-pixel width.
 
     cv2.polylines only accepts an integer thickness — rounding a 1.5px
@@ -554,20 +571,47 @@ def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=4)
     which puts a hard lower bound of ~104 on the stroke's true peak-darkness
     value — that alone rules out the width implied by a 2px-equivalent
     stroke, since it would require every pixel's deficit to stay under ~68).
-    So: supersample the polyline at an *integer* thickness scaled up by
+
+    Fix: supersample the polyline at an *integer* thickness scaled up by
     `supersample`, then area-downsample back to native resolution — the
     box-filter downsample reconstructs the fractional/sub-pixel width
-    accurately instead of rounding it away.
+    instead of rounding it away. cv2's own LINE_AA kernel has a small fixed
+    spatial extent that becomes a shrinking *relative* error as supersample
+    increases (measured empirically: ~0.44px residual at supersample=4,
+    ~0.09px at 16, ~0.045px at 32 — roughly halving each doubling, i.e. the
+    residual itself, not just its ratio to target, needs a high supersample
+    to become negligible; a fixed additive correction doesn't work because
+    ss_thickness rounds to an integer before cv2 ever sees it). supersample
+    must be high enough that this residual is negligible; 32 was the first
+    value tested where a 1.5px target came back at 1.545px, not 1.68-1.95px.
+
+    Only the polylines' own bounding box (+ padding) is supersampled, not
+    the whole canvas — at 1500px a full-canvas 32x supersample would be
+    tens of GB; a bounding-box crop keeps this to under a second and under
+    ~1GB transient for a canvas-spanning outline.
     """
     h, w = shape_hw
+    all_pts = np.vstack([p.reshape(-1, 2) for p in polylines_pts])
+    pad = int(np.ceil(stroke_width_px)) + 2
+    x0 = max(0, int(np.floor(all_pts[:, 0].min())) - pad)
+    y0 = max(0, int(np.floor(all_pts[:, 1].min())) - pad)
+    x1 = min(w, int(np.ceil(all_pts[:, 0].max())) + pad)
+    y1 = min(h, int(np.ceil(all_pts[:, 1].max())) + pad)
+    coverage = np.zeros((h, w), dtype=np.float64)
+    cw, ch = x1 - x0, y1 - y0
+    if cw <= 0 or ch <= 0:
+        return coverage
+
     ss_thickness = max(1, round(stroke_width_px * supersample))
-    big = np.zeros((h * supersample, w * supersample), dtype=np.uint8)
+    big = np.zeros((ch * supersample, cw * supersample), dtype=np.uint8)
     for pts in polylines_pts:
-        big_pts = (pts.reshape(-1, 1, 2).astype(np.float64) * supersample).astype(np.int32)
+        local = pts.reshape(-1, 2).astype(np.float64) - [x0, y0]
+        big_pts = (local * supersample).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(big, [big_pts], isClosed=True, color=255,
                       thickness=ss_thickness, lineType=cv2.LINE_AA)
-    coverage = cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA)
-    return coverage.astype(np.float64) / 255.0
+    crop_coverage = cv2.resize(big, (cw, ch), interpolation=cv2.INTER_AREA)
+    coverage[y0:y1, x0:x1] = crop_coverage.astype(np.float64) / 255.0
+    return coverage
 
 
 def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px,
@@ -1114,22 +1158,49 @@ def render_svg(layout, size, copies):
     )
 
 
+def expected_outputs(path: Path, args):
+    """Files this invocation would write for `path`. Used by both the
+    --force/skip-existing check and could double as a cleanup manifest."""
+    outs = [args.outdir / f"{path.stem}_1x.png", args.outdir / f"{path.stem}_3x.png"]
+    if args.debug:
+        outs.append(args.outdir / f"{path.stem}_debug.png")
+    if args.svg:
+        outs.append(args.outdir / f"{path.stem}.svg")
+    return outs
+
+
+def outputs_exist(path: Path, args):
+    outs = expected_outputs(path, args)
+    return bool(outs) and all(p.exists() for p in outs)
+
+
 def process_image(path: Path, args):
+    """Returns {"path", "status", "reason"} — status is 'ok', 'skipped'
+    (outputs already existed and --force wasn't given), or 'failed' (reason
+    holds why). Never raises for expected failure modes (unreadable image,
+    no device found, no target region); unexpected exceptions are left to
+    propagate and are caught by the caller (main), one file's crash must
+    not abort the rest of a batch."""
+    if not args.force and outputs_exist(path, args):
+        print(f"skip {path.name}: outputs already exist (use --force to reprocess)")
+        return {"path": path, "status": "skipped", "reason": "outputs already exist"}
+
     img = cv2.imread(str(path))
     if img is None:
         print(f"skip {path}: could not read image", file=sys.stderr)
-        return
+        return {"path": path, "status": "failed", "reason": "could not read image"}
 
     inset_x_pct, inset_y_pct = resolve_inset_pct(args)
     result = detect_target(img, tol=args.tol, target=args.target,
                             inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct, fit_pct=args.fit)
     if result is None:
         print(f"skip {path}: no device found", file=sys.stderr)
-        return
+        return {"path": path, "status": "failed", "reason": "no device found"}
     if args.target != "body" and not result.get("target_found", True):
-        print(f"skip {path}: body found but no {args.target} region detected inside it "
+        reason = f"no {args.target} region detected inside body"
+        print(f"skip {path}: body found but {reason} "
               f"(try --target body, or --debug to see why)", file=sys.stderr)
-        return
+        return {"path": path, "status": "failed", "reason": reason}
 
     x, y, w, h = result["body_bbox"]
     shape = "circle/ellipse" if result["is_circle"] else f"{len(result['outline'])}-point polygon"
@@ -1173,6 +1244,8 @@ def process_image(path: Path, args):
         svg_path = args.outdir / f"{path.stem}.svg"
         svg_path.write_text(svg_text, encoding="utf-8")
         print(f"  wrote {svg_path}")
+
+    return {"path": path, "status": "ok", "reason": None}
 
 
 def resolve_inset_pct(args):
@@ -1220,15 +1293,45 @@ def build_parser():
                          f"{FIXED_DEFAULT_TOL} if no confident gap is found")
     p.add_argument("--svg", action="store_true")
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--force", action="store_true",
+                    help="reprocess even if this file's outputs already exist in --outdir")
     return p
+
+
+def print_batch_summary(results):
+    ok = [r for r in results if r["status"] == "ok"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+    failed = [r for r in results if r["status"] == "failed"]
+
+    print(f"\n{len(results)} file(s): {len(ok)} ok, {len(skipped)} skipped, {len(failed)} failed")
+    if skipped:
+        print("  skipped (outputs already existed — use --force to reprocess):")
+        for r in skipped:
+            print(f"    {r['path'].name}")
+    if failed:
+        print("  failed:")
+        for r in failed:
+            print(f"    {r['path'].name}: {r['reason']}")
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    for path in collect_inputs(args.input):
-        process_image(path, args)
-    return 0
+    inputs = collect_inputs(args.input)
+    results = []
+    for path in inputs:
+        try:
+            results.append(process_image(path, args))
+        except Exception as e:
+            # one bad file must not abort a batch of twenty — record it and
+            # keep going, so a rerun with the same command only has to
+            # reprocess the ones that actually failed (skip-if-exists takes
+            # care of the ones that already succeeded).
+            print(f"FAILED {path}: {type(e).__name__}: {e}", file=sys.stderr)
+            results.append({"path": path, "status": "failed", "reason": f"{type(e).__name__}: {e}"})
+
+    print_batch_summary(results)
+    return 1 if any(r["status"] == "failed" for r in results) else 0
 
 
 if __name__ == "__main__":

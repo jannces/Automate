@@ -875,6 +875,166 @@ def test_compound_path_holes_are_evenodd_subpaths():
     assert d.count("Z") == 2
 
 
+# --- Stroke sub-pixel width (post-stage-5 follow-up) -------------------------
+
+def test_stroke_width_is_subpixel_accurate_not_rounded():
+    """Regression guard for the fix: cv2.polylines only accepts integer
+    thickness, so a naive round(1.5) draws a 2px-thick stroke (~33% too
+    thick). stroke_coverage_map must integrate to close to the requested
+    sub-pixel width instead. Measured against ref_1x.jpg (see CLAUDE.md): a
+    clean axis-aligned stroke crossing showed a pixel at deficit 104/255,
+    putting a hard lower bound on the true width that rules out anything
+    close to 2px — the reference is closer to 1.5 than 2, per the spec's
+    own stated stroke width."""
+    pts = np.array([[50, 10], [50, 90]], dtype=np.float64).reshape(-1, 1, 2)
+
+    integrated_15 = ss.stroke_coverage_map((100, 100), [pts], stroke_width_px=1.5)[50, :].sum()
+    integrated_20 = ss.stroke_coverage_map((100, 100), [pts], stroke_width_px=2.0)[50, :].sum()
+
+    # within ~5% of the requested width, not rounded up to the next integer
+    assert abs(integrated_15 - 1.5) < 0.1
+    assert abs(integrated_20 - 2.0) < 0.1
+    # and a 1.5 target must land closer to 1.5 than a naive round-to-2 would
+    assert abs(integrated_15 - 1.5) < abs(integrated_15 - 2.0)
+
+
+# --- Stage 6: batch mode -----------------------------------------------------
+
+def _write_synthetic_device_png(path):
+    canvas, _ = _synthetic_light_grey_device()
+    cv2.imwrite(str(path), canvas)
+
+
+def _batch_args(input_path, outdir, **overrides):
+    argv = [str(input_path), "--outdir", str(outdir)]
+    args = ss.build_parser().parse_args(argv)
+    for k, v in overrides.items():
+        setattr(args, k, v)
+    return args
+
+
+def test_process_image_skips_when_outputs_already_exist(tmp_path):
+    """Second run over the same file, without --force, must not redo the
+    work — this is what makes 'rerun just the one that failed' cheap
+    instead of reprocessing the whole batch."""
+    src = tmp_path / "device.png"
+    _write_synthetic_device_png(src)
+    outdir = tmp_path / "out"
+
+    args = _batch_args(src, outdir)
+    first = ss.process_image(src, args)
+    assert first["status"] == "ok"
+    mtime_1x = (outdir / "device_1x.png").stat().st_mtime
+
+    second = ss.process_image(src, args)
+    assert second["status"] == "skipped"
+    assert (outdir / "device_1x.png").stat().st_mtime == mtime_1x  # untouched
+
+
+def test_force_reprocesses_existing_outputs(tmp_path):
+    src = tmp_path / "device.png"
+    _write_synthetic_device_png(src)
+    outdir = tmp_path / "out"
+
+    ss.process_image(src, _batch_args(src, outdir))
+    forced = ss.process_image(src, _batch_args(src, outdir, force=True))
+    assert forced["status"] == "ok"
+
+
+def test_outputs_exist_accounts_for_debug_and_svg_flags(tmp_path):
+    """Re-running with --debug or --svg added, when only the plain PNGs
+    exist from a prior run, must NOT be treated as already-done — those
+    specific files genuinely don't exist yet."""
+    src = tmp_path / "device.png"
+    _write_synthetic_device_png(src)
+    outdir = tmp_path / "out"
+
+    ss.process_image(src, _batch_args(src, outdir))  # plain run: _1x/_3x only
+    assert not ss.outputs_exist(src, _batch_args(src, outdir, debug=True))
+    assert not ss.outputs_exist(src, _batch_args(src, outdir, svg=True))
+    assert ss.outputs_exist(src, _batch_args(src, outdir))
+
+
+def test_batch_one_failure_does_not_abort_the_rest(tmp_path, capsys):
+    """A folder of several files where one fails (e.g. a blank image with
+    no detectable device) must still process the others, exit non-zero,
+    and let a rerun of the same command redo only the failed one (the
+    others get skipped via outputs-already-exist)."""
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    _write_synthetic_device_png(folder / "a_good.png")
+    _write_synthetic_device_png(folder / "c_good.png")
+    cv2.imwrite(str(folder / "b_blank.png"), np.full((300, 300, 3), 255, dtype=np.uint8))
+    outdir = tmp_path / "out"
+
+    exit_code = ss.main([str(folder), "--outdir", str(outdir)])
+
+    assert exit_code == 1
+    assert (outdir / "a_good_1x.png").exists()
+    assert (outdir / "c_good_1x.png").exists()
+    assert not (outdir / "b_blank_1x.png").exists()
+
+    out = capsys.readouterr().out
+    assert "3 file(s): 2 ok, 0 skipped, 1 failed" in out
+    assert "b_blank.png" in out
+
+    # rerun: the two good ones are skipped (already exist), only the
+    # failure is retried — and fails again for the same reason, not a crash.
+    exit_code_2 = ss.main([str(folder), "--outdir", str(outdir)])
+    out2 = capsys.readouterr().out
+    assert exit_code_2 == 1
+    assert "3 file(s): 0 ok, 2 skipped, 1 failed" in out2
+
+
+def test_batch_summary_lists_ok_and_failed_files(tmp_path, capsys):
+    folder = tmp_path / "batch2"
+    folder.mkdir()
+    _write_synthetic_device_png(folder / "good.png")
+    cv2.imwrite(str(folder / "bad.png"), np.full((300, 300, 3), 255, dtype=np.uint8))
+    outdir = tmp_path / "out2"
+
+    exit_code = ss.main([str(folder), "--outdir", str(outdir)])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "2 file(s): 1 ok, 0 skipped, 1 failed" in out
+    assert "bad.png: no device found" in out
+
+
+def test_unexpected_exception_in_one_file_does_not_abort_batch(tmp_path, monkeypatch, capsys):
+    """A genuine crash (not just a detection failure) partway through one
+    file must be caught by main(), recorded as failed, and not stop the
+    rest of the batch."""
+    folder = tmp_path / "batch3"
+    folder.mkdir()
+    _write_synthetic_device_png(folder / "a_good.png")
+    _write_synthetic_device_png(folder / "z_good.png")
+    outdir = tmp_path / "out3"
+
+    real_render_outputs = ss.render_outputs
+
+    # simplest reliable trigger: fail deterministically for the first file
+    # processed (alphabetical order -> a_good.png), succeed for the rest.
+    call_count = {"n": 0}
+
+    def flaky_render_outputs(img, result, args, notches_pct=None, layout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("boom")
+        return real_render_outputs(img, result, args, notches_pct, layout=layout)
+
+    monkeypatch.setattr(ss, "render_outputs", flaky_render_outputs)
+
+    exit_code = ss.main([str(folder), "--outdir", str(outdir)])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert not (outdir / "a_good_1x.png").exists()
+    assert (outdir / "z_good_1x.png").exists()
+    assert "2 file(s): 1 ok, 0 skipped, 1 failed" in out
+    assert "a_good.png: RuntimeError: boom" in out
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
