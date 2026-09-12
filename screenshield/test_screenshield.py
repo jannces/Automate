@@ -6,6 +6,7 @@ import numpy as np
 import screenshield as ss
 
 REF_1X = Path(__file__).parent / "ref_1x.jpg"
+CLEAN_DEVICE = Path(__file__).parent / "input" / "test_clean_device.png"
 
 # Measured directly from ref_1x.jpg (not from the .ai file, per spec: rendered reference wins).
 TRUE_BODY_BBOX = (61, 325, 1234, 694)  # x, y, w, h
@@ -250,6 +251,263 @@ def test_canvas_transform_frames_three_sheet_extent_identically():
     assert abs(left - 1500 * 0.04) < 1500 * 0.01
     assert abs((1500 - right) - 1500 * 0.04) < 1500 * 0.01
     assert top > 1500 * 0.04 and (1500 - bottom) > 1500 * 0.04
+
+
+# --- Stage 3: cutouts / notches ---------------------------------------------
+
+# Measured directly from ref_1x.jpg, absolute pixels: two small rectangular
+# cutouts on the device's right edge, visible through the sheet. These are
+# SHEET-1 positions (the sheet is offset from the device by
+# DEFAULT_OFFSET_PCT), not device positions — subtract sheet-1's own offset
+# before converting to device-relative percentages, or the profile stores
+# the wrong location for every sheet.
+REFERENCE_CUTOUTS_SHEET_PX = [
+    (1309, 521, 35, 15),
+    (1309, 552, 35, 16),
+]
+
+
+def _sheet1_offset_px(body_bbox):
+    _, _, body_w, body_h = body_bbox
+    return ss.sheet_offset_px(body_w, body_h, DEFAULT_OFFSET_PCT)
+
+
+def test_notch_pct_round_trips_reference_cutouts():
+    """Convert the reference cutouts (measured on sheet 1) to device-relative
+    percentages against TRUE_BODY_BBOX, then back to pixels, and confirm both
+    the device-space rect AND the re-offset sheet-1 rect reproduce the
+    original measurement exactly — this is the check that catches an
+    off-by-the-offset bug rather than just an off-by-a-constant one."""
+    ox, oy = _sheet1_offset_px(TRUE_BODY_BBOX)
+
+    for sx, sy, sw, sh in REFERENCE_CUTOUTS_SHEET_PX:
+        device_rect = (sx - ox, sy - oy, sw, sh)
+        dx0, dy0, dw, dh = device_rect
+        device_points = np.array(
+            [[dx0, dy0], [dx0 + dw, dy0], [dx0 + dw, dy0 + dh], [dx0, dy0 + dh]],
+            dtype=np.float64).reshape(-1, 1, 2)
+
+        pct = ss.notch_points_to_pct(device_points, TRUE_BODY_BBOX)
+        round_tripped = ss.notch_pct_to_points(pct, TRUE_BODY_BBOX)
+
+        rx0, ry0, rx1, ry1 = ss.outline_bounds(round_tripped)
+        assert abs(rx0 - dx0) < 1e-6
+        assert abs(ry0 - dy0) < 1e-6
+        assert abs((rx1 - rx0) - dw) < 1e-6
+        assert abs((ry1 - ry0) - dh) < 1e-6
+
+        # re-apply sheet-1's own offset and confirm we land back on the
+        # ORIGINAL sheet-space measurement.
+        resheeted = ss.translate_outline(round_tripped, ox, oy)
+        sx0, sy0, sx1, sy1 = ss.outline_bounds(resheeted)
+        assert abs(sx0 - sx) < 1e-6
+        assert abs(sy0 - sy) < 1e-6
+        assert abs((sx1 - sx0) - sw) < 1e-6
+        assert abs((sy1 - sy0) - sh) < 1e-6
+
+
+def test_notch_profile_json_round_trip(tmp_path):
+    """--notch args written to --profile, then read back on a fresh 'next
+    run' via --notches profile (no --notch given), must reproduce the exact
+    same percentages — and, combined with the offset math above, the exact
+    same absolute sheet-space position."""
+    profile_path = tmp_path / "device.json"
+    bx, by, bw, bh = TRUE_BODY_BBOX
+    ox, oy = _sheet1_offset_px(TRUE_BODY_BBOX)
+
+    device_rects_pct = []
+    for sx, sy, sw, sh in REFERENCE_CUTOUTS_SHEET_PX:
+        dx, dy = sx - ox, sy - oy
+        device_rects_pct.append((
+            (dx - bx) / bw * 100.0,
+            (dy - by) / bh * 100.0,
+            sw / bw * 100.0,
+            sh / bh * 100.0,
+        ))
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "profile"
+    args.notch = [list(r) for r in device_rects_pct]
+    args.profile = profile_path
+    written = ss.resolve_notches(args)
+    assert profile_path.exists()
+
+    args2 = Args()  # fresh "next shot of the same model" — zero-input
+    args2.notches = "profile"
+    args2.notch = None
+    args2.profile = profile_path
+    read_back = ss.resolve_notches(args2)
+
+    assert read_back == written
+    for got, expected in zip(read_back, device_rects_pct):
+        assert abs(got["x_pct"] - expected[0]) < 1e-9
+        assert abs(got["y_pct"] - expected[1]) < 1e-9
+        assert abs(got["w_pct"] - expected[2]) < 1e-9
+        assert abs(got["h_pct"] - expected[3]) < 1e-9
+
+    for notch_pct, (sx, sy, sw, sh) in zip(read_back, REFERENCE_CUTOUTS_SHEET_PX):
+        device_points = ss.notch_pct_to_points(notch_pct, TRUE_BODY_BBOX)
+        resheeted = ss.translate_outline(device_points, ox, oy)
+        rx0, ry0, rx1, ry1 = ss.outline_bounds(resheeted)
+        assert abs(rx0 - sx) < 1e-6
+        assert abs(ry0 - sy) < 1e-6
+        assert abs((rx1 - rx0) - sw) < 1e-6
+        assert abs((ry1 - ry0) - sh) < 1e-6
+
+
+def test_notches_none_mode_ignores_profile(tmp_path):
+    """--notches none must return no notches even if a profile with saved
+    notches exists — an explicit opt-out, not just 'no --notch given'."""
+    profile_path = tmp_path / "device.json"
+    ss.save_profile(profile_path, {"notches": [{"x_pct": 1, "y_pct": 1, "w_pct": 1, "h_pct": 1}]})
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "none"
+    args.notch = None
+    args.profile = profile_path
+    assert ss.resolve_notches(args) == []
+
+
+# --- Stage 3: --pick (interactive ROI selection) ----------------------------
+
+def test_pick_rois_round_trip_reference_cutouts():
+    """Feed synthetic ROI tuples — what cv2.selectROIs would return, in the
+    SCALED display window's pixel space — directly into the conversion
+    function they flow into, and confirm they land on the same percentages
+    as the manual --notch path for the same physical locations. --pick
+    operates on the input device photo directly (device-space already, no
+    sheet offset involved), unlike the ref_1x.jpg-derived measurements
+    above which were sheet-1 positions."""
+    display_scale = 0.6
+    ox, oy = _sheet1_offset_px(TRUE_BODY_BBOX)
+    bx, by, bw, bh = TRUE_BODY_BBOX
+
+    expected_pct = []
+    synthetic_rois = []
+    for sx, sy, sw, sh in REFERENCE_CUTOUTS_SHEET_PX:
+        dx, dy = sx - ox, sy - oy  # device-space location of the real cutout
+        expected_pct.append((
+            (dx - bx) / bw * 100.0,
+            (dy - by) / bh * 100.0,
+            sw / bw * 100.0,
+            sh / bh * 100.0,
+        ))
+        # what selectROIs would report after the display was shrunk by scale
+        synthetic_rois.append((dx * display_scale, dy * display_scale,
+                                sw * display_scale, sh * display_scale))
+
+    got = ss.rois_to_notches_pct(synthetic_rois, display_scale, TRUE_BODY_BBOX)
+
+    assert len(got) == len(expected_pct)
+    for notch, (ex, ey, ew, eh) in zip(got, expected_pct):
+        assert abs(notch["x_pct"] - ex) < 1e-6
+        assert abs(notch["y_pct"] - ey) < 1e-6
+        assert abs(notch["w_pct"] - ew) < 1e-6
+        assert abs(notch["h_pct"] - eh) < 1e-6
+
+
+def test_pick_display_scale_must_be_divided_out():
+    """Regression guard for the specific bug the spec warned about: if the
+    display-scale division were dropped, the same picked pixel ROI would
+    silently produce a different (wrong) percentage depending on window
+    size. Assert scale=1.0 and scale=0.5 on the identical ROI give the
+    correctly-differing percentages, not the same wrong one."""
+    body_bbox = (0, 0, 1000, 1000)
+    roi = [(100, 100, 50, 50)]
+
+    full_scale = ss.rois_to_notches_pct(roi, 1.0, body_bbox)[0]
+    half_scale = ss.rois_to_notches_pct(roi, 0.5, body_bbox)[0]
+
+    assert abs(full_scale["x_pct"] - 10.0) < 1e-9   # 100/1000*100
+    assert abs(half_scale["x_pct"] - 20.0) < 1e-9   # (100/0.5)/1000*100
+    assert full_scale != half_scale
+
+
+def test_pick_writes_same_profile_schema_as_notch(tmp_path, monkeypatch):
+    """--pick must write into the same profile JSON schema --notch produces,
+    so the two routes are interchangeable. Exercises pick_notches end to
+    end (not just the math) by monkeypatching cv2.selectROIs — no display
+    needed, this is what makes it testable at all."""
+    profile_pick = tmp_path / "pick.json"
+    profile_notch = tmp_path / "notch.json"
+    body_bbox = (0, 0, 1000, 800)
+    display_scale = 0.5
+
+    roi_px = (100, 100, 50, 40)  # real device-space rect this simulates
+    synthetic_roi = (roi_px[0] * display_scale, roi_px[1] * display_scale,
+                      roi_px[2] * display_scale, roi_px[3] * display_scale)
+
+    monkeypatch.setattr(ss, "compute_display_scale", lambda shape, max_display=900: display_scale)
+    monkeypatch.setattr(ss.cv2, "selectROIs", lambda *a, **k: np.array([synthetic_roi]))
+    monkeypatch.setattr(ss.cv2, "destroyAllWindows", lambda: None)
+    monkeypatch.setattr(ss.cv2, "resize", lambda img, size, **k: img)  # skip the real resize
+
+    fake_img = np.zeros((800, 1000, 3), dtype=np.uint8)
+    picked = ss.pick_notches(fake_img, body_bbox, profile_path=profile_pick)
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "profile"
+    args.notch = [[roi_px[0] / body_bbox[2] * 100.0, roi_px[1] / body_bbox[3] * 100.0,
+                    roi_px[2] / body_bbox[2] * 100.0, roi_px[3] / body_bbox[3] * 100.0]]
+    args.profile = profile_notch
+    via_notch = ss.resolve_notches(args)
+
+    assert set(ss.load_profile(profile_pick).keys()) == set(ss.load_profile(profile_notch).keys())
+    assert len(picked) == len(via_notch) == 1
+    for key in ("x_pct", "y_pct", "w_pct", "h_pct"):
+        assert abs(picked[0][key] - via_notch[0][key]) < 1e-6
+
+
+# --- Stage 3: --notches auto -------------------------------------------------
+
+def test_notches_auto_reports_confidence_and_warns(capsys):
+    """--notches auto must always print a warning to check the debug image,
+    plus a confidence signal (found/kept/rejected counts) — required
+    regardless of how accurate detection turns out to be on a given photo,
+    since the method is explicitly best-effort (spec)."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    result = ss.detect_body(img, tol=None, inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT)
+
+    class Args:
+        pass
+
+    args = Args()
+    args.notches = "auto"
+    args.notch = None
+    args.profile = None
+    args.pick = False
+
+    ss.resolve_notches(args, img=img, result=result)
+    out = capsys.readouterr().out.lower()
+    assert "warning" in out
+    assert "check" in out and "debug" in out
+    assert "kept" in out and "rejected" in out
+
+
+def test_notches_auto_report_counts_are_consistent():
+    """found == kept + rejected_area always, and the report dict always has
+    the same keys — callers print these directly, they must never be
+    missing. Also documents actual, honest behavior on the reference
+    device: the two real cutouts are low-contrast (similar brightness to
+    the surrounding grey bezel panel) and are NOT found by this brightness-
+    based heuristic, while bright unrelated features (printed logo text,
+    the top edge highlight) are — this is exactly the kind of false
+    positive/false negative the spec warns is expected from auto mode."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    result = ss.detect_body(img, tol=None, inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT)
+    notches, report = ss.detect_notches_auto(img, result["body_contour"], result["body_bbox"])
+
+    assert report["found"] == report["kept"] + report["rejected_area"]
+    assert len(notches) == report["kept"]
 
 
 if __name__ == "__main__":
