@@ -544,6 +544,32 @@ def place_image_on_canvas(img, scale, tx, ty, canvas_size, bg_color=(255, 255, 2
     return canvas
 
 
+def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=4):
+    """Anti-aliased stroke coverage in [0,1] at a true sub-pixel width.
+
+    cv2.polylines only accepts an integer thickness — rounding a 1.5px
+    target up to 2px draws a stroke that's ~33% thicker than intended, a
+    real, measurable difference (cross-checked against ref_1x.jpg: a clean
+    axis-aligned stroke crossing showed a pixel at deficit 104 out of 255,
+    which puts a hard lower bound of ~104 on the stroke's true peak-darkness
+    value — that alone rules out the width implied by a 2px-equivalent
+    stroke, since it would require every pixel's deficit to stay under ~68).
+    So: supersample the polyline at an *integer* thickness scaled up by
+    `supersample`, then area-downsample back to native resolution — the
+    box-filter downsample reconstructs the fractional/sub-pixel width
+    accurately instead of rounding it away.
+    """
+    h, w = shape_hw
+    ss_thickness = max(1, round(stroke_width_px * supersample))
+    big = np.zeros((h * supersample, w * supersample), dtype=np.uint8)
+    for pts in polylines_pts:
+        big_pts = (pts.reshape(-1, 1, 2).astype(np.float64) * supersample).astype(np.int32)
+        cv2.polylines(big, [big_pts], isClosed=True, color=255,
+                      thickness=ss_thickness, lineType=cv2.LINE_AA)
+    coverage = cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA)
+    return coverage.astype(np.float64) / 255.0
+
+
 def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px,
                   fill_color=(255, 255, 255), stroke_color=STROKE_COLOR_RGB,
                   notch_rects_px=None):
@@ -575,19 +601,8 @@ def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px
         cv2.fillPoly(fill_mask, [notch_pts], 0)
     composite_layer_over(canvas_f, fill_mask > 0, fill_color, style_alpha * layer_alpha)
 
-    # cv2.polylines with LINE_AA on a uint8 mask gives real 0-255 coverage
-    # at the edge (not a hard binary blob) — normalize that to a [0,1]
-    # coverage map and use it as a per-pixel alpha multiplier, so a
-    # partially-covered edge pixel gets a partial blend instead of a jaggy.
-    stroke_coverage = np.zeros((h, w), dtype=np.uint8)
-    thickness = max(1, round(stroke_width_px))
-    cv2.polylines(stroke_coverage, [pts], isClosed=True, color=255,
-                  thickness=thickness, lineType=cv2.LINE_AA)
-    for notch_pts in notches:
-        cv2.polylines(stroke_coverage, [notch_pts], isClosed=True, color=255,
-                      thickness=thickness, lineType=cv2.LINE_AA)
-    composite_layer_over(canvas_f, stroke_coverage.astype(np.float64) / 255.0,
-                          stroke_color, layer_alpha)
+    stroke_coverage = stroke_coverage_map((h, w), [pts] + notches, stroke_width_px)
+    composite_layer_over(canvas_f, stroke_coverage, stroke_color, layer_alpha)
 
 
 # --- Stage 3: cutouts / notches ---------------------------------------------
