@@ -156,6 +156,102 @@ def test_auto_tol_falls_back_on_featureless_image():
     assert tol == ss.FIXED_DEFAULT_TOL
 
 
+# --- Stage 2: opacity model -------------------------------------------------
+
+# Spec's required test (PROMPT.md "Opacity" section): sampling ref_3x.jpg
+# over the black bezel in each overlap region gives these four alpha
+# values. Reproduce all four within 0.005.
+REFERENCE_ALPHA_SHEET1_ALONE = 0.251
+REFERENCE_ALPHA_SHEETS_1_2 = 0.439
+REFERENCE_ALPHA_ALL_THREE = 0.663
+REFERENCE_ALPHA_1X_SINGLE = 0.502
+
+STYLE_ALPHA = 0.50
+LAYER_ALPHAS_3X = [0.5, 0.5, 0.8]  # nearest, middle, furthest/frontmost
+
+
+def test_composite_alpha_matches_reference_numbers():
+    """Pure math check on the opacity model itself (no geometry, no pixels)
+    — isolates the compositing formula so a bug here can't hide behind a
+    geometry bug in the pixel-level test below."""
+    effective = [STYLE_ALPHA * la for la in LAYER_ALPHAS_3X]
+
+    sheet1_alone = ss.composite_alpha(effective[:1])
+    sheets_1_2 = ss.composite_alpha(effective[:2])
+    all_three = ss.composite_alpha(effective)
+    single_1x = ss.composite_alpha([STYLE_ALPHA * 1.0])
+
+    assert abs(sheet1_alone - REFERENCE_ALPHA_SHEET1_ALONE) <= 0.005
+    assert abs(sheets_1_2 - REFERENCE_ALPHA_SHEETS_1_2) <= 0.005
+    assert abs(all_three - REFERENCE_ALPHA_ALL_THREE) <= 0.005
+    assert abs(single_1x - REFERENCE_ALPHA_1X_SINGLE) <= 0.005
+
+
+def _sample_alpha_over_black(pixel_rgb):
+    """White fill over a pure-black bezel: alpha recovers linearly."""
+    return float(pixel_rgb[0]) / 255.0
+
+
+def test_render_sheet_pixel_alpha_matches_reference_numbers():
+    """End-to-end version of the same test: actually calls render_sheet (not
+    just the abstract formula) on a black canvas with staggered rectangular
+    sheets and samples real output pixels, so a bug in the mask/compositing
+    code — not just the math — would show up here too."""
+    canvas = np.zeros((400, 400, 3), dtype=np.float64)  # black bezel stand-in
+
+    def rect_outline(x0, y0, x1, y1):
+        return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64).reshape(-1, 1, 2)
+
+    sheets = [
+        rect_outline(50, 50, 250, 250),
+        rect_outline(80, 80, 280, 280),
+        rect_outline(110, 110, 310, 310),
+    ]
+    for outline, layer_alpha in zip(sheets, LAYER_ALPHAS_3X):
+        ss.render_sheet(canvas, outline, STYLE_ALPHA, layer_alpha, stroke_width_px=0)
+
+    sheet1_alone_px = canvas[60, 60]     # inside sheet1 only
+    sheets_1_2_px = canvas[90, 90]       # inside sheet1+2, outside sheet3
+    all_three_px = canvas[150, 150]      # inside all three
+
+    assert abs(_sample_alpha_over_black(sheet1_alone_px) - REFERENCE_ALPHA_SHEET1_ALONE) <= 0.005
+    assert abs(_sample_alpha_over_black(sheets_1_2_px) - REFERENCE_ALPHA_SHEETS_1_2) <= 0.005
+    assert abs(_sample_alpha_over_black(all_three_px) - REFERENCE_ALPHA_ALL_THREE) <= 0.005
+
+    canvas_1x = np.zeros((400, 400, 3), dtype=np.float64)
+    ss.render_sheet(canvas_1x, sheets[0], STYLE_ALPHA, layer_alpha=1.0, stroke_width_px=0)
+    single_1x_px = canvas_1x[60, 60]
+    assert abs(_sample_alpha_over_black(single_1x_px) - REFERENCE_ALPHA_1X_SINGLE) <= 0.005
+
+
+def test_canvas_transform_frames_three_sheet_extent_identically():
+    """Both outputs must reuse the same transform — device lands at the same
+    position/scale in the 1x and 3x file. Framing independently per-output
+    (e.g. tightest-fit around just the 1x content) is exactly what the spec
+    says not to do."""
+    body_bbox = (100, 100, 400, 300)
+    outlines = ss.sheet_outlines(
+        np.array([[100, 100], [500, 100], [500, 400], [100, 400]], dtype=np.float64).reshape(-1, 1, 2),
+        body_w=400, body_h=300, offset_pct=(8, 15), step_pct=(3, 8), copies=3,
+    )
+    content_bbox = ss.compute_content_bbox(body_bbox, outlines)
+    scale, tx, ty = ss.compute_canvas_transform(content_bbox, canvas_size=1500, margin_pct=4.0)
+
+    # sanity: transformed content bbox sits within canvas bounds with ~4% margin
+    minx, miny, maxx, maxy = content_bbox
+    left = minx * scale + tx
+    top = miny * scale + ty
+    right = maxx * scale + tx
+    bottom = maxy * scale + ty
+    assert left >= 0 and top >= 0 and right <= 1500 and bottom <= 1500
+    # content is wider than tall, so width hits the ~4% margin tightly on
+    # both sides; height (uniformly scaled, then centered) gets more margin
+    # — that's correct aspect-preserving fit, not a bug.
+    assert abs(left - 1500 * 0.04) < 1500 * 0.01
+    assert abs((1500 - right) - 1500 * 0.04) < 1500 * 0.01
+    assert top > 1500 * 0.04 and (1500 - bottom) > 1500 * 0.04
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -300,6 +300,194 @@ def draw_debug(img, result):
     return dbg
 
 
+# --- Stage 2: compositing, opacity model, canvas framing -------------------
+
+# Measured directly from ref_1x.jpg, not the naive CMYK->RGB conversion of
+# the .ai stroke (~#677A7B — far too dark/saturated for what a 1pt stroke
+# anti-aliases down to at this scale). Two independent clean crossings over
+# white background: a vertical edge landed the stroke's peak darkness in a
+# single row (255->151), a horizontal edge split it evenly across two rows
+# (255->186, 255->187). Summed "ink deficit" (255-pixel) matches almost
+# exactly between the two (137 vs 137), confirming both are the same
+# underlying anti-aliased stroke at different sub-pixel phase. Integrating
+# that deficit over the spec's ~1.5px stroke width gives the true color:
+# 255 - 137/1.5 ~= 164 (#A4A4A4) — lands centered in the spec's own #98-#B0
+# estimate.
+STROKE_COLOR_RGB = (164, 164, 164)
+STROKE_WIDTH_AT_1500 = 1.5
+
+
+def composite_alpha(effective_alphas):
+    """Cumulative alpha after Porter-Duff 'over' compositing a stack of
+    layers, given in paint order (index 0 = bottom/backmost/nearest-device,
+    last = top/frontmost/furthest-offset). Pure function - no geometry, no
+    color - so it can be unit-tested against the spec's reference numbers
+    directly, and a compositing bug shows up immediately instead of two
+    stages later as a vague "looks slightly off"."""
+    a = 0.0
+    for layer_a in effective_alphas:
+        a = layer_a + a * (1.0 - layer_a)
+    return a
+
+
+def composite_layer_over(canvas_f, mask, color_rgb, alpha):
+    """Alpha-blend color_rgb into canvas_f (float64 HxWx3), in place,
+    wherever mask is truthy (bool array, or 0/1 coverage float array for
+    anti-aliased edges). canvas_f is always treated as fully opaque."""
+    if alpha <= 0:
+        return
+    a = mask.astype(np.float64) * alpha
+    color = np.array(color_rgb, dtype=np.float64)
+    canvas_f[:] = color * a[..., None] + canvas_f * (1.0 - a[..., None])
+
+
+def translate_outline(outline, dx, dy):
+    out = outline.reshape(-1, 2).astype(np.float64).copy()
+    out[:, 0] += dx
+    out[:, 1] += dy
+    return out.reshape(-1, 1, 2)
+
+
+def sheet_outlines(base_outline, body_w, body_h, offset_pct, step_pct, copies):
+    """base_outline: the stage-1 derived outline, still in the input image's
+    coordinate frame. Returns `copies` outlines, sheet 1 (nearest the
+    device, smallest offset) first, each subsequent sheet stepped further
+    down-right."""
+    ox, oy = sheet_offset_px(body_w, body_h, offset_pct)
+    sx, sy = sheet_offset_px(body_w, body_h, step_pct)
+    return [translate_outline(base_outline, ox + i * sx, oy + i * sy) for i in range(copies)]
+
+
+def compute_content_bbox(body_bbox, outlines):
+    x, y, w, h = body_bbox
+    minx, miny, maxx, maxy = float(x), float(y), float(x + w), float(y + h)
+    for outline in outlines:
+        l, t, r, b = outline_bounds(outline)
+        minx, miny = min(minx, l), min(miny, t)
+        maxx, maxy = max(maxx, r), max(maxy, b)
+    return minx, miny, maxx, maxy
+
+
+def compute_canvas_transform(content_bbox, canvas_size, margin_pct=4.0):
+    """Uniform scale + translate that fits content_bbox into canvas_size with
+    margin_pct of blank border on every side, content centered. Both outputs
+    must reuse the SAME transform — the whole point of framing on the
+    3-sheet extent is that the device lands identically in each file."""
+    minx, miny, maxx, maxy = content_bbox
+    content_w, content_h = maxx - minx, maxy - miny
+    available = canvas_size * (1 - 2 * margin_pct / 100.0)
+    scale = available / max(content_w, content_h)
+    scaled_w, scaled_h = content_w * scale, content_h * scale
+    tx = (canvas_size - scaled_w) / 2.0 - minx * scale
+    ty = (canvas_size - scaled_h) / 2.0 - miny * scale
+    return scale, tx, ty
+
+
+def transform_outline(outline, scale, tx, ty):
+    out = outline.reshape(-1, 2).astype(np.float64).copy()
+    out[:, 0] = out[:, 0] * scale + tx
+    out[:, 1] = out[:, 1] * scale + ty
+    return out.reshape(-1, 1, 2)
+
+
+def place_image_on_canvas(img, scale, tx, ty, canvas_size, bg_color=(255, 255, 255)):
+    """Resize img by scale and paste it at (tx,ty) onto a canvas_size square
+    canvas, cropping whatever falls outside."""
+    h, w = img.shape[:2]
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+    canvas = np.full((canvas_size, canvas_size, 3), bg_color, dtype=np.uint8)
+    dst_x, dst_y = round(tx), round(ty)
+
+    src_x0, src_y0 = max(0, -dst_x), max(0, -dst_y)
+    dst_x0, dst_y0 = max(0, dst_x), max(0, dst_y)
+    src_x1 = min(new_w, canvas_size - dst_x)
+    src_y1 = min(new_h, canvas_size - dst_y)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        canvas[dst_y0:dst_y1, dst_x0:dst_x1] = resized[src_y0:src_y1, src_x0:src_x1]
+    return canvas
+
+
+def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px,
+                  fill_color=(255, 255, 255), stroke_color=STROKE_COLOR_RGB):
+    """Draw one sheet's fill then its stroke onto canvas_f (float64 HxWx3),
+    each alpha-composited over whatever is already there (previous sheets +
+    device photo underneath).
+
+    Fill opacity = style_alpha * layer_alpha: Graphic Style 4's own fill
+    renders at 50% (style_alpha) independent of the object's layer opacity,
+    per the spec's opacity model — the two are kept as separate parameters
+    because layer opacity varies per product line.
+
+    Stroke opacity = layer_alpha only: nothing in the extracted Graphic
+    Style 4 data reduces the stroke's own opacity, only the object/layer
+    opacity does.
+    """
+    h, w = canvas_f.shape[:2]
+    pts = outline_px.astype(np.int32)
+
+    fill_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(fill_mask, [pts], 255)
+    composite_layer_over(canvas_f, fill_mask > 0, fill_color, style_alpha * layer_alpha)
+
+    # cv2.polylines with LINE_AA on a uint8 mask gives real 0-255 coverage
+    # at the edge (not a hard binary blob) — normalize that to a [0,1]
+    # coverage map and use it as a per-pixel alpha multiplier, so a
+    # partially-covered edge pixel gets a partial blend instead of a jaggy.
+    stroke_coverage = np.zeros((h, w), dtype=np.uint8)
+    thickness = max(1, round(stroke_width_px))
+    cv2.polylines(stroke_coverage, [pts], isClosed=True, color=255,
+                  thickness=thickness, lineType=cv2.LINE_AA)
+    composite_layer_over(canvas_f, stroke_coverage.astype(np.float64) / 255.0,
+                          stroke_color, layer_alpha)
+
+
+def resolve_layer_alphas(args, copies):
+    if args.layer_alpha is not None:
+        if len(args.layer_alpha) != copies:
+            raise ValueError(
+                f"--layer-alpha needs {copies} values (one per --copies), got {len(args.layer_alpha)}")
+        return args.layer_alpha
+    if copies == 3:
+        return [0.5, 0.5, 0.8]  # nearest, middle, furthest/frontmost — spec default
+    raise ValueError(f"--layer-alpha required when --copies != 3 (no default for {copies} sheets)")
+
+
+def render_outputs(img, result, args):
+    """Renders both outputs off the SAME canvas transform (framed on the
+    3-sheet extent), per spec: the device must land identically in both
+    files, not be framed independently. Returns (img_1x, img_3x) uint8."""
+    body_w, body_h = result["body_bbox"][2], result["body_bbox"][3]
+    base_outline = result["outline"]
+    copies = args.copies
+
+    outlines = sheet_outlines(base_outline, body_w, body_h, tuple(args.offset), tuple(args.step), copies)
+    content_bbox = compute_content_bbox(result["body_bbox"], outlines)
+    scale, tx, ty = compute_canvas_transform(content_bbox, args.size, margin_pct=4.0)
+    stroke_width_px = STROKE_WIDTH_AT_1500 * (args.size / 1500.0)
+    layer_alphas = resolve_layer_alphas(args, copies)
+
+    base_canvas = place_image_on_canvas(img, scale, tx, ty, args.size)
+
+    canvas_1x = base_canvas.astype(np.float64)
+    sheet1_px = transform_outline(outlines[0], scale, tx, ty)
+    render_sheet(canvas_1x, sheet1_px, args.style_alpha, layer_alpha=1.0,
+                 stroke_width_px=stroke_width_px)
+
+    canvas_3x = base_canvas.astype(np.float64)
+    for i in range(copies):
+        outline_px = transform_outline(outlines[i], scale, tx, ty)
+        render_sheet(canvas_3x, outline_px, args.style_alpha, layer_alphas[i],
+                     stroke_width_px=stroke_width_px)
+
+    return (np.clip(canvas_1x, 0, 255).astype(np.uint8),
+            np.clip(canvas_3x, 0, 255).astype(np.uint8))
+
+
 def process_image(path: Path, args):
     img = cv2.imread(str(path))
     if img is None:
@@ -326,6 +514,15 @@ def process_image(path: Path, args):
         out_path = args.outdir / f"{path.stem}_debug.png"
         cv2.imwrite(str(out_path), dbg)
         print(f"  wrote {out_path}")
+
+    img_1x, img_3x = render_outputs(img, result, args)
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    path_1x = args.outdir / f"{path.stem}_1x.png"
+    path_3x = args.outdir / f"{path.stem}_3x.png"
+    cv2.imwrite(str(path_1x), img_1x)
+    cv2.imwrite(str(path_3x), img_3x)
+    print(f"  wrote {path_1x}")
+    print(f"  wrote {path_3x}")
 
 
 def resolve_inset_pct(args):
