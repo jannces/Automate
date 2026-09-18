@@ -402,6 +402,11 @@ ILLUSTRATOR_SHEET_LTRB = (40, 40, 1259, 715)
 ILLUSTRATOR_GS4_OCTAGON = Path(__file__).parent / "illustrator_gs4_octagon.png"
 ILLUSTRATOR_OCTAGON = (40, 40, 1219, 675)  # left, top, width, height (image coords)
 
+# Graphic Style 4's STROKE alone (fill removed) over white, on a 600x400
+# octagon with 80px chamfers at half-pixel coordinates so a whole pixel is
+# fully covered. Same RGB document and export settings.
+ILLUSTRATOR_GS4_STROKE = Path(__file__).parent / "illustrator_gs4_stroke.png"
+
 
 def test_gs4_gradient_opacity_profile():
     t = np.array([-0.2, 0.0, 0.5, 0.5637, 0.6209, 0.6781, 0.6795, 0.9, 1.2])
@@ -1313,25 +1318,70 @@ def test_compound_path_holes_are_evenodd_subpaths():
 
 # --- Stroke sub-pixel width (post-stage-5 follow-up) -------------------------
 
-def test_stroke_width_is_subpixel_accurate_not_rounded():
-    """Regression guard for the fix: cv2.polylines only accepts integer
-    thickness, so a naive round(1.5) draws a 2px-thick stroke (~33% too
-    thick). stroke_coverage_map must integrate to close to the requested
-    sub-pixel width instead. Measured against ref_1x.jpg (see CLAUDE.md): a
-    clean axis-aligned stroke crossing showed a pixel at deficit 104/255,
-    putting a hard lower bound on the true width that rules out anything
-    close to 2px — the reference is closer to 1.5 than 2, per the spec's
-    own stated stroke width."""
-    pts = np.array([[50, 10], [50, 90]], dtype=np.float64).reshape(-1, 1, 2)
+def test_stroke_width_is_exact_at_every_width_and_subpixel_phase():
+    """Total ink across a crossing is width x (255 - colour), and it is
+    phase-independent — the one number a straight edge can reveal without
+    knowing where the path sits between pixels. So it must come out exactly
+    right at any width and any sub-pixel offset.
 
-    integrated_15 = ss.stroke_coverage_map((100, 100), [pts], stroke_width_px=1.5)[50, :].sum()
-    integrated_20 = ss.stroke_coverage_map((100, 100), [pts], stroke_width_px=2.0)[50, :].sum()
+    This is the regression guard for a real over-inking bug: the previous
+    implementation supersampled cv2.polylines, which renders a thickness-t
+    line as 2*floor((t+1)/2)+1 pixels — always ODD. At supersample 32 a 1.0px
+    target could only land on 0.96875 or 1.03125, and it drew 1.031 (plus
+    LINE_AA softening on top, giving 1.055). That put ~142 ink on the canvas
+    where Illustrator puts 135. No supersample fixes it; the achievable
+    widths simply never include the target.
+    """
+    for width in (0.25, 0.5, 0.75, 1.0, 1.317, 1.5, 2.0, 3.0):
+        for phase in (0.0, 0.25, 0.5, 0.5 + 1e-9, 0.73):
+            pts = np.array([[50 + phase, 10], [50 + phase, 90]], dtype=np.float64).reshape(-1, 1, 2)
+            got = ss.stroke_coverage_map((100, 100), [pts], stroke_width_px=width)[50, :].sum()
+            assert abs(got - width) < 1e-9, (width, phase, got)
 
-    # within ~5% of the requested width, not rounded up to the next integer
-    assert abs(integrated_15 - 1.5) < 0.1
-    assert abs(integrated_20 - 2.0) < 0.1
-    # and a 1.5 target must land closer to 1.5 than a naive round-to-2 would
-    assert abs(integrated_15 - 1.5) < abs(integrated_15 - 2.0)
+    assert ss.stroke_coverage_map((100, 100), [np.array([[50, 10], [50, 90]], dtype=np.float64)
+                                               .reshape(-1, 1, 2)], stroke_width_px=0.0).max() == 0.0
+
+
+def test_stroke_matches_illustrator_export_pixel_for_pixel():
+    """Against Illustrator's own export of Graphic Style 4's stroke alone
+    (fill removed) over white, on an octagon placed at half-pixel coordinates
+    so a whole pixel is fully covered.
+
+    Illustrator's DOM reports strokeWidth 1 and RGB (120,120,120) directly in
+    the RGB document, so width and colour are not inferred from pixels here —
+    they are read off the file, and the export only has to confirm them. On
+    the straight edges it does so exactly: one pixel at 120, total ink 135.
+
+    Diagonals are deliberately NOT asserted tight. Illustrator's own 45deg
+    antialiasing is heavier than true area coverage — it saturates the centre
+    pixel and still puts 51/135 either side, 237 ink per row where the
+    geometry says sqrt(2)*135 = 191. Ours lands at 214, between the two. That
+    gap is Illustrator's rasteriser, not the artwork, so it is documented
+    rather than matched with an angle-dependent fudge.
+    """
+    ai = cv2.imread(str(ILLUSTRATOR_GS4_STROKE)).astype(np.float64).mean(axis=2)
+    h, w = ai.shape
+    l, t, ow, oh, k = 100.5, 100.5, 600.0, 400.0, 80.0
+    pts = _octagon_pts(l, t, ow, oh, k, k, k, k).reshape(-1, 1, 2)
+    canvas = np.full((h, w, 3), 255.0)
+    ss.render_sheet(canvas, pts, 0.0, 1.0, stroke_width_px=1.0)
+    ours = canvas[:, :, 0]
+
+    # straight edges: pixel-identical, and the ink is exactly width*(255-colour)
+    for prof_ai, prof_ours in ((ai[300, 96:106], ours[300, 96:106]),
+                               (ai[96:106, 400], ours[96:106, 400])):
+        assert np.array_equal(prof_ai, prof_ours)
+        assert abs((255 - prof_ours).sum() - 135.0) < 1e-6
+        assert prof_ours.min() == ss.STROKE_COLOR_RGB[0]
+
+    # a stroke can never be darker than its own colour, on any edge angle
+    assert ours.min() >= ss.STROKE_COLOR_RGB[0]
+    assert ai.min() == ss.STROKE_COLOR_RGB[0]
+
+    ys, xs = np.mgrid[0:h, 0:w]
+    on_straight = (((np.abs(xs - 100) <= 3) | (np.abs(xs - 700) <= 3)) & (ys > 200) & (ys < 400)) | \
+                  (((np.abs(ys - 100) <= 3) | (np.abs(ys - 500) <= 3)) & (xs > 250) & (xs < 550))
+    assert np.abs(ours - ai)[on_straight].max() == 0.0
 
 
 # --- Stage 6: batch mode -----------------------------------------------------

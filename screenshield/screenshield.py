@@ -819,56 +819,63 @@ def place_image_on_canvas(img, scale, tx, ty, canvas_size, bg_color=(255, 255, 2
     return canvas
 
 
-def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=32):
+def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, closed=True):
     """Anti-aliased stroke coverage in [0,1] at a true sub-pixel width.
 
-    cv2.polylines only accepts an integer thickness — rounding a 1.5px
-    target up to 2px draws a stroke that's ~33% thicker than intended, a
-    real, measurable difference (cross-checked against ref_1x.jpg: a clean
-    axis-aligned stroke crossing showed a pixel at deficit 104 out of 255,
-    which puts a hard lower bound of ~104 on the stroke's true peak-darkness
-    value — that alone rules out the width implied by a 2px-equivalent
-    stroke, since it would require every pixel's deficit to stay under ~68).
+    Coverage is computed analytically: the exact distance from each pixel
+    centre to each segment, then `clip(w/2 - dist + 0.5, 0, 1)`. For a band
+    at least a pixel wide that is the exact area coverage, so total ink
+    across a crossing comes out to exactly `stroke_width_px` — no bias to
+    calibrate away, at any width or sub-pixel phase.
 
-    Fix: supersample the polyline at an *integer* thickness scaled up by
-    `supersample`, then area-downsample back to native resolution — the
-    box-filter downsample reconstructs the fractional/sub-pixel width
-    instead of rounding it away. cv2's own LINE_AA kernel has a small fixed
-    spatial extent that becomes a shrinking *relative* error as supersample
-    increases (measured empirically: ~0.44px residual at supersample=4,
-    ~0.09px at 16, ~0.045px at 32 — roughly halving each doubling, i.e. the
-    residual itself, not just its ratio to target, needs a high supersample
-    to become negligible; a fixed additive correction doesn't work because
-    ss_thickness rounds to an integer before cv2 ever sees it). supersample
-    must be high enough that this residual is negligible; 32 was the first
-    value tested where a 1.5px target came back at 1.545px, not 1.68-1.95px.
+    This replaces supersampling the polyline with cv2.polylines, which could
+    not hit an exact width even in principle: cv2 renders a thickness-t line
+    as `2*floor((t+1)/2) + 1` pixels, i.e. always an ODD number, so at
+    supersample s the achievable widths are (2k+1)/s and a 1.0px target at
+    s=32 can only land on 0.96875 or 1.03125. That ~3% floor (plus LINE_AA's
+    own softening on top, which the area-downsample makes unnecessary) is
+    what made the renderer emit ~142 ink where Illustrator emits 135.
+    Raising the supersample only halves the gap and costs memory
+    quadratically, so the whole approach was the wrong shape.
 
-    Only the polylines' own bounding box (+ padding) is supersampled, not
-    the whole canvas — at 1500px a full-canvas 32x supersample would be
-    tens of GB; a bounding-box crop keeps this to under a second and under
-    ~1GB transient for a canvas-spanning outline.
+    Joins are round (distance-to-segment), against Illustrator's miter. On a
+    1px stroke that is a sub-pixel difference at the chamfer corners only.
     """
     h, w = shape_hw
-    all_pts = np.vstack([p.reshape(-1, 2) for p in polylines_pts])
-    pad = int(np.ceil(stroke_width_px)) + 2
-    x0 = max(0, int(np.floor(all_pts[:, 0].min())) - pad)
-    y0 = max(0, int(np.floor(all_pts[:, 1].min())) - pad)
-    x1 = min(w, int(np.ceil(all_pts[:, 0].max())) + pad)
-    y1 = min(h, int(np.ceil(all_pts[:, 1].max())) + pad)
     coverage = np.zeros((h, w), dtype=np.float64)
-    cw, ch = x1 - x0, y1 - y0
-    if cw <= 0 or ch <= 0:
+    if stroke_width_px <= 0:
         return coverage
+    radius = stroke_width_px / 2.0
+    pad = int(np.ceil(radius + 1.0))
 
-    ss_thickness = max(1, round(stroke_width_px * supersample))
-    big = np.zeros((ch * supersample, cw * supersample), dtype=np.uint8)
     for pts in polylines_pts:
-        local = pts.reshape(-1, 2).astype(np.float64) - [x0, y0]
-        big_pts = (local * supersample).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(big, [big_pts], isClosed=True, color=255,
-                      thickness=ss_thickness, lineType=cv2.LINE_AA)
-    crop_coverage = cv2.resize(big, (cw, ch), interpolation=cv2.INTER_AREA)
-    coverage[y0:y1, x0:x1] = crop_coverage.astype(np.float64) / 255.0
+        p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if len(p) < 2:
+            continue
+        seg = np.concatenate([p, p[:1]]) if closed else p
+        for a, b in zip(seg[:-1], seg[1:]):
+            x0 = max(0, int(np.floor(min(a[0], b[0]))) - pad)
+            x1 = min(w, int(np.ceil(max(a[0], b[0]))) + pad + 1)
+            y0 = max(0, int(np.floor(min(a[1], b[1]))) - pad)
+            y1 = min(h, int(np.ceil(max(a[1], b[1]))) + pad + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            ys, xs = np.mgrid[y0:y1, x0:x1]
+            px, py = xs + 0.5, ys + 0.5
+            abx, aby = b[0] - a[0], b[1] - a[1]
+            len2 = abx * abx + aby * aby
+            if len2 <= 0:
+                t = np.zeros_like(px)
+            else:
+                t = np.clip(((px - a[0]) * abx + (py - a[1]) * aby) / len2, 0.0, 1.0)
+            dist = np.hypot(px - (a[0] + t * abx), py - (a[1] + t * aby))
+            # exact 1-D overlap of the band [dist-radius, dist+radius] with the
+            # pixel's [-0.5, 0.5]. Identical to clip(radius - dist + 0.5) for a
+            # band at least a pixel wide; below that it stops over-counting,
+            # where a single pixel can contain both edges of the band.
+            local = np.clip(np.minimum(0.5, dist + radius)
+                            - np.maximum(-0.5, dist - radius), 0.0, 1.0)
+            np.maximum(coverage[y0:y1, x0:x1], local, out=coverage[y0:y1, x0:x1])
     return coverage
 
 
