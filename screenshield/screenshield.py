@@ -214,14 +214,184 @@ def offset_filled_mask(filled, offset_x_px, offset_y_px):
     raise ValueError(f"mixed-sign offset not supported: ({offset_x_px}, {offset_y_px})")
 
 
-def derive_outline(contour, mask_shape, inset_x_px, inset_y_px, epsilon_frac=0.004):
-    """Fill contour, offset by (inset_x_px, inset_y_px) — signed: positive
-    erodes/shrinks inward (body inset, or a negative --fit contracting into
-    a recess), negative dilates/grows outward (a positive --fit bleeding
-    past a screen) — re-contour, simplify (or fit circle/ellipse). The
-    kernel is itself elliptical/anisotropic so the x and y components are
-    honored independently — do not offset uniformly and patch afterwards,
-    that can't reproduce a non-uniform true offset."""
+# --- Parametric primitive: rotated rectangle with one shared corner ----------
+#
+# The protector is generated from (center, width, height, rotation, corner
+# size) alone, like Illustrator's rectangle tool, so edges are straight and all
+# four corners are identical by construction. kind is "chamfer" (45deg cut,
+# `corner` = leg length along each side) or "round" (`corner` = radius).
+
+PRIMITIVE_KINDS = ("chamfer", "round")
+
+
+def _to_primitive_frame(pts, prim):
+    d = pts - np.array([prim["cx"], prim["cy"]])
+    c, s = np.cos(prim["theta"]), np.sin(prim["theta"])
+    return np.column_stack([d[:, 0] * c + d[:, 1] * s, -d[:, 0] * s + d[:, 1] * c])
+
+
+def primitive_signed_distance(pts, prim):
+    """Negative inside, positive outside. Exact for round; for chamfer exact
+    inside and along edges, a slight underestimate just outside a vertex."""
+    q = np.abs(_to_primitive_frame(pts, prim))
+    hx, hy = prim["w"] / 2.0, prim["h"] / 2.0
+    k = float(np.clip(prim["corner"], 0.0, min(hx, hy)))
+    if prim["kind"] == "round":
+        qx, qy = q[:, 0] - (hx - k), q[:, 1] - (hy - k)
+        return (np.hypot(np.maximum(qx, 0), np.maximum(qy, 0))
+                + np.minimum(np.maximum(qx, qy), 0) - k)
+    box = np.maximum(q[:, 0] - hx, q[:, 1] - hy)
+    cut = (q[:, 0] + q[:, 1] - (hx + hy - k)) / np.sqrt(2.0)
+    return np.maximum(box, cut)
+
+
+def _primitive_from_vector(kind, p):
+    return {"kind": kind, "cx": p[0], "cy": p[1], "w": p[2], "h": p[3], "theta": p[4], "corner": p[5]}
+
+
+def _initial_box(points, theta=None):
+    """Rotation from the min-area rect's most horizontal edge (unless given),
+    then extents of the points along that frame."""
+    if theta is None:
+        box = cv2.boxPoints(cv2.minAreaRect(points.astype(np.float32)))
+        edges = [box[(i + 1) % 4] - box[i] for i in range(4)]
+        angles = [np.arctan2(e[1], e[0]) for e in edges]
+        theta = min(((a + np.pi / 2) % np.pi - np.pi / 2 for a in angles), key=abs)
+    c, s = np.cos(theta), np.sin(theta)
+    u = points[:, 0] * c + points[:, 1] * s
+    v = -points[:, 0] * s + points[:, 1] * c
+    uc, vc = (u.min() + u.max()) / 2.0, (v.min() + v.max()) / 2.0
+    return uc * c - vc * s, uc * s + vc * c, u.max() - u.min(), v.max() - v.min(), theta
+
+
+def fit_primitive(points, kind, huber_px=1.0, iters=60, fixed_theta=None):
+    """Robust (Huber IRLS) Levenberg-Marquardt fit of one primitive kind to
+    boundary points. Returns (primitive, residuals). If the fitted rotation
+    moves the far end of the longest side by under 1px it isn't resolvable
+    from a pixel contour, so rotation is pinned to 0 and the rest refit."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    cx, cy, w, h, theta = _initial_box(points, fixed_theta)
+    area = cv2.contourArea(points.astype(np.float32))
+    deficit = max(w * h - area, 0.0)
+    corner0 = np.sqrt(deficit / 2.0) if kind == "chamfer" else np.sqrt(deficit / (4.0 - np.pi))
+
+    def cost(p):
+        r = primitive_signed_distance(points, _primitive_from_vector(kind, p))
+        a = np.abs(r)
+        return np.sum(np.where(a <= huber_px, 0.5 * r * r, huber_px * (a - 0.5 * huber_px))), r
+
+    best = None
+    for start_corner in (corner0, 0.0):
+        p = np.array([cx, cy, w, h, theta, start_corner], dtype=np.float64)
+        c0, r = cost(p)
+        lam = 1e-3
+        eps = np.array([1e-3, 1e-3, 1e-3, 1e-3, 1e-6, 1e-3])
+        for _ in range(iters):
+            J = np.empty((len(points), 6))
+            for j in range(6):
+                dp = np.zeros(6)
+                dp[j] = eps[j]
+                J[:, j] = (primitive_signed_distance(points, _primitive_from_vector(kind, p + dp)) - r) / eps[j]
+            if fixed_theta is not None:
+                J[:, 4] = 0.0
+            a = np.abs(r)
+            wts = np.where(a <= huber_px, 1.0, huber_px / np.maximum(a, 1e-12))
+            A = J.T @ (J * wts[:, None])
+            g = J.T @ (wts * r)
+            improved = False
+            while lam < 1e8:
+                step = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-9), -g)
+                cand = p + step
+                cand[5] = max(cand[5], 0.0)
+                c1, r1 = cost(cand)
+                if c1 < c0:
+                    p, c0, r, lam, improved = cand, c1, r1, lam * 0.3, True
+                    break
+                lam *= 10.0
+            if not improved or np.max(np.abs(step[:4])) < 1e-4 and abs(step[4]) < 1e-7:
+                break
+        if best is None or c0 < best[0]:
+            best = (c0, p, r)
+    prim = _primitive_from_vector(kind, best[1])
+    if fixed_theta is None and abs(np.sin(prim["theta"])) * max(prim["w"], prim["h"]) < 1.0:
+        return fit_primitive(points, kind, huber_px, iters, fixed_theta=0.0)
+    return prim, best[2]
+
+
+def offset_primitive(prim, dx, dy):
+    """Minkowski offset by an axis-aligned ellipse with semi-axes (|dx|,|dy|)
+    in the primitive's own frame; positive shrinks, negative grows (same sign
+    convention as offset_filled_mask). Straight sides move by dx/dy exactly;
+    the corner is re-solved so its 45deg point moves by the ellipse's support
+    distance, which is exact for chamfers and for isotropic rounds."""
+    delta = np.copysign(np.hypot(dx, dy), dx + dy) - dx - dy
+    corner = prim["corner"] + (delta if prim["kind"] == "chamfer" else delta / (2.0 - np.sqrt(2.0)))
+    out = dict(prim)
+    out.update(w=prim["w"] - 2.0 * dx, h=prim["h"] - 2.0 * dy, corner=max(0.0, corner))
+    return out
+
+
+def primitive_points(prim, arc_segments=24):
+    """Closed outline, clockwise in image coordinates, starting at the top-right corner."""
+    hx, hy = prim["w"] / 2.0, prim["h"] / 2.0
+    k = float(np.clip(prim["corner"], 0.0, min(hx, hy)))
+    # corner centres/directions: top-right, bottom-right, bottom-left, top-left
+    corners = [(1, -1), (1, 1), (-1, 1), (-1, -1)]
+    local = []
+    for sx, sy in corners:
+        if k < 1e-6:
+            local.append((sx * hx, sy * hy))
+        elif prim["kind"] == "chamfer":
+            # travelling clockwise: arrive along the horizontal or vertical side first
+            if sx * sy < 0:
+                local += [(sx * (hx - k), sy * hy), (sx * hx, sy * (hy - k))]
+            else:
+                local += [(sx * hx, sy * (hy - k)), (sx * (hx - k), sy * hy)]
+        else:
+            ccx, ccy = sx * (hx - k), sy * (hy - k)
+            start = {(1, -1): -np.pi / 2, (1, 1): 0.0, (-1, 1): np.pi / 2, (-1, -1): np.pi}[(sx, sy)]
+            for a in np.linspace(start, start + np.pi / 2, arc_segments + 1):
+                local.append((ccx + k * np.cos(a), ccy + k * np.sin(a)))
+    local = np.array(local, dtype=np.float64)
+    c, s = np.cos(prim["theta"]), np.sin(prim["theta"])
+    xs = prim["cx"] + local[:, 0] * c - local[:, 1] * s
+    ys = prim["cy"] + local[:, 0] * s + local[:, 1] * c
+    return np.column_stack([xs, ys]).astype(np.float32).reshape(-1, 1, 2)
+
+
+def fit_best_primitive(contour):
+    """Fit every primitive kind to a pixel contour and keep the best. Contour
+    coordinates are pixel indices; boundary pixel centres sit at +0.5, and the
+    true edge is a further half pixel outward, so the fit is grown by 0.5px."""
+    pts = contour.reshape(-1, 2).astype(np.float64) + 0.5
+    fits = []
+    for kind in PRIMITIVE_KINDS:
+        prim, resid = fit_primitive(pts, kind)
+        fits.append((np.sqrt(np.mean(np.minimum(resid ** 2, 4.0))), kind, prim, resid))
+    _, kind, prim, resid = min(fits, key=lambda f: f[0])
+    return offset_primitive(prim, -0.5, -0.5), resid
+
+
+# A primitive describes the shape if nearly every contour point lies on it.
+# Chamfered reference device: 0.2-0.4% of points beyond 2px; the wrong kind
+# (round fit to that chamfered body) already reaches 3.4%.
+PRIMITIVE_OUTLIER_PX = 2.0
+PRIMITIVE_MAX_OUTLIER_FRAC = 0.02
+
+
+def derive_outline(contour, mask_shape, inset_x_px, inset_y_px, shape="primitive", epsilon_frac=0.004):
+    """Protector outline from a target contour, offset by (inset_x_px,
+    inset_y_px) — signed: positive shrinks inward (body inset, negative
+    --fit), negative grows outward (positive --fit).
+
+    Near-circular targets get an ellipse fit. Otherwise shape="primitive"
+    fits a rectangle with one shared chamfer/radius to the contour, offsets
+    the parameters analytically and generates the outline from them — the
+    traced contour itself is discarded. If no primitive describes the
+    contour, or shape="trace", it falls back to eroding the mask and
+    simplifying the traced contour.
+
+    Returns (outline, is_circle, info); info["warning"] is set on fallback."""
     filled = np.zeros(mask_shape, dtype=np.uint8)
     cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
 
@@ -229,18 +399,32 @@ def derive_outline(contour, mask_shape, inset_x_px, inset_y_px, epsilon_frac=0.0
 
     offset_contour = largest_external_contour(offset, chain=cv2.CHAIN_APPROX_NONE)
     if offset_contour is None:
-        return None, False
+        return None, False, {"method": None, "warning": None}
 
     if is_near_circular(offset_contour):
         ellipse = cv2.fitEllipse(offset_contour)
-        return ellipse, True
+        return ellipse, True, {"method": "ellipse", "warning": None}
+
+    info = {"method": "trace", "warning": None}
+    if shape == "primitive":
+        prim, resid = fit_best_primitive(contour)
+        outlier_frac = float(np.mean(np.abs(resid) > PRIMITIVE_OUTLIER_PX))
+        info.update(fit_primitive=prim, outlier_frac=outlier_frac,
+                    median_resid_px=float(np.median(np.abs(resid))))
+        if outlier_frac <= PRIMITIVE_MAX_OUTLIER_FRAC:
+            protector = offset_primitive(prim, inset_x_px, inset_y_px)
+            info.update(method="primitive", primitive=protector)
+            return primitive_points(protector), False, info
+        info["warning"] = (f"{outlier_frac:.1%} of the outline is more than {PRIMITIVE_OUTLIER_PX:g}px "
+                           f"off the best rectangle fit ({prim['kind']}) — not a rectangle-tool shape, "
+                           f"using the traced outline instead")
 
     perimeter = cv2.arcLength(offset_contour, True)
     epsilon = epsilon_frac * perimeter
     approx = cv2.approxPolyDP(offset_contour, epsilon, True)
     corner_margin_px = 1.5 * max(abs(inset_x_px), abs(inset_y_px))
     approx = snap_polygon_to_lines(offset_contour, approx, corner_margin_px=corner_margin_px)
-    return approx, False
+    return approx, False, info
 
 
 def ellipse_to_points(ellipse, n=72):
@@ -269,7 +453,7 @@ def outline_bounds(pts):
     return float(x0), float(y0), float(x1), float(y1)
 
 
-def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False):
+def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False, shape="primitive"):
     """tol: fixed threshold to use, or None to run auto_tol.
     inset_x_pct: % of body WIDTH. inset_y_pct: % of body HEIGHT — these are
     independent because the true inset is not generally isotropic in px."""
@@ -281,7 +465,7 @@ def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False):
         resolved_tol, used_auto, border_p99 = float(tol), False, None
 
     mask = device_mask(img, bg, resolved_tol)
-    body_contour = largest_external_contour(mask)
+    body_contour = largest_external_contour(mask, chain=cv2.CHAIN_APPROX_NONE)
     if body_contour is None:
         return None
 
@@ -289,7 +473,7 @@ def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False):
     inset_x_px = (inset_x_pct / 100.0) * w
     inset_y_px = (inset_y_pct / 100.0) * h
 
-    outline, is_circle = derive_outline(body_contour, mask.shape[:2], inset_x_px, inset_y_px)
+    outline, is_circle, shape_info = derive_outline(body_contour, mask.shape[:2], inset_x_px, inset_y_px, shape)
     outline_pts = ellipse_to_points(outline) if is_circle else outline
 
     result = {
@@ -301,6 +485,7 @@ def detect_body(img, tol, inset_x_pct, inset_y_pct, debug=False):
         "inset_y_px": inset_y_px,
         "outline": outline_pts,
         "is_circle": is_circle,
+        "shape_info": shape_info,
         "tol_used": resolved_tol,
         "tol_auto": used_auto,
         "border_p99": border_p99,
@@ -378,7 +563,7 @@ def find_active_region_contour(img, body_contour, mode):
     return candidate
 
 
-def detect_target(img, tol, target, inset_x_pct=0.0, inset_y_pct=0.0, fit_pct=0.0):
+def detect_target(img, tol, target, inset_x_pct=0.0, inset_y_pct=0.0, fit_pct=0.0, shape="primitive"):
     """Body detection is always run first (needed for the bbox regardless of
     target — canvas framing and sheet offsets are body-relative). For
     target=='body' the returned outline is body_contour eroded by
@@ -391,7 +576,7 @@ def detect_target(img, tol, target, inset_x_pct=0.0, inset_y_pct=0.0, fit_pct=0.
     width/height (not the body's), same spirit as inset_x/inset_y being
     percentages of the body's own width/height in body mode.
     """
-    result = detect_body(img, tol, inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct)
+    result = detect_body(img, tol, inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct, shape=shape)
     if result is None or target == "body":
         return result
 
@@ -405,8 +590,10 @@ def detect_target(img, tol, target, inset_x_pct=0.0, inset_y_pct=0.0, fit_pct=0.
     fit_y_px = (fit_pct / 100.0) * ah
     # derive_outline's offset is signed positive=erode/shrink; --fit's sign
     # convention is positive=expand/bleed outward, so negate going in.
-    outline, is_circle = derive_outline(active_contour, result["mask"].shape[:2], -fit_x_px, -fit_y_px)
+    outline, is_circle, shape_info = derive_outline(active_contour, result["mask"].shape[:2],
+                                                    -fit_x_px, -fit_y_px, shape)
     outline_pts = ellipse_to_points(outline) if is_circle else outline
+    result["shape_info"] = shape_info
 
     result["target_found"] = True
     result["active_region_contour"] = active_contour
@@ -434,36 +621,90 @@ def draw_debug(img, result, notch_points=None):
 
 # --- Stage 2: compositing, opacity model, canvas framing -------------------
 
-# Width and color measured directly from ref_1x.jpg TOGETHER, as a coupled
-# pair — not the .ai file's naive CMYK->RGB conversion (~#677A7B, far too
-# dark/saturated for what a 1pt stroke anti-aliases down to at this scale),
-# and not spec's stated "~1.5px" taken on faith either. Solved from two
-# invariants:
+# Graphic Style 4, read from screenshield-gs.ai and confirmed through
+# Illustrator 26's own scripting API and PNG export (RGB document, 1pt = 1px).
 #
-# 1. Total ink deficit (sum of 255-pixel across a full perpendicular
-#    crossing) equals width * true_full_coverage_deficit (D), and is
-#    INVARIANT to sub-pixel phase. Two independent clean axis-aligned
-#    crossings over white background agree almost exactly: a vertical edge
-#    (255->222, 255->151) sums to 137; a horizontal edge (255->186,
-#    255->187) also sums to 137.
-# 2. The vertical edge's peak pixel (151, deficit 104) is the darkest pixel
-#    found at any clean axis-aligned crossing (checked at 3 widely
-#    separated points along each edge, always identical — not JPEG noise).
-#    No pixel's deficit can exceed D, so this alone proves D >= 104, which
-#    already rules out the ~91 a 1.5px-width assumption implies. Taking
-#    this peak as at-or-near saturation (D=104) and combining it with the
-#    invariant total (137) pins BOTH unknowns as one solve, not two
-#    separate guesses: W = total/D = 137/104 ~= 1.317px,
-#    color = 255 - D = 255 - 104 = 151 (#979797).
-#
-# 151 lands almost exactly on the LOWER edge of the spec's own independent
-# eyeballed estimate (#98-#B0, i.e. 152-176) rather than mid-range, which
-# the old width-assumed 164 did. Width and color must be changed together:
-# shipping 151 with the old 1.5px width reproduces a total ink deficit of
-# ~161 at this color, not the reference's measured 137 — verified by
-# rendering and re-sampling the actual composite (see CLAUDE.md).
-STROKE_COLOR_RGB = (151, 151, 151)
-STROKE_WIDTH_AT_1500 = 1.317
+# Stroke: 1pt of CMYK 54.6/46.1/45.7/11.1, which Illustrator converts to
+# RGB 120,120,120. Total ink across a crossing (width x deficit = 135) is all
+# a straight edge can reveal, so width and colour can't be separated there;
+# the reference's diagonal chamfers can: pixels as dark as 116-125 exist in
+# ref_1x.jpg, impossible for any stroke lighter than ~120.
+STROKE_COLOR_RGB = (120, 120, 120)
+STROKE_WIDTH_AT_1500 = 1.0
+
+# Fill: "Unnamed gradient 386", white at every stop, 135deg linear.
+# (ramp position, opacity, midpoint) — a stop's midpoint shapes the segment
+# from that stop to the NEXT one (verified by render), so the 0.13 on the
+# last stop has no effect.
+GS4_FILL_COLOR_RGB = (255, 255, 255)
+GS4_GRADIENT_STOPS = (
+    (0.563678075396825, 0.50, 0.50),
+    (0.678172900129539, 0.40, 0.50),
+    (0.679036097633494, 0.60, 0.13),
+)
+GS4_GRADIENT_ANGLE_DEG = 135.0
+# Applying the style fits the gradient to the object's bounds measured in the
+# GRADIENT'S OWN rotated frame (see gradient_vector), then shifts the origin by
+# this fraction of that length toward the end stop.
+GS4_GRADIENT_ORIGIN_SHIFT = 0.047487965341241
+
+
+def gradient_midpoint_curve(s, midpoint):
+    """Illustrator's in-segment interpolation, s in [0,1] -> [0,1], reaching
+    0.5 at `midpoint`. Fit to Illustrator renders at midpoints 13/50/80."""
+    s = np.asarray(s, dtype=np.float64)
+    if midpoint >= 0.5:
+        return s ** (np.log(0.5) / np.log(midpoint))
+    return 1.0 - (1.0 - s) ** (np.log(0.5) / np.log(1.0 - midpoint))
+
+
+def gradient_opacity(t, stops=GS4_GRADIENT_STOPS):
+    """Opacity at gradient position t (0..1, clamped beyond the end stops)."""
+    t = np.asarray(t, dtype=np.float64)
+    out = np.full(t.shape, stops[0][1])
+    for (r0, a0, mid), (r1, a1, _) in zip(stops, stops[1:]):
+        seg = (t > r0) & (t <= r1)
+        s = (t[seg] - r0) / (r1 - r0)
+        out[seg] = a0 + (a1 - a0) * gradient_midpoint_curve(s, mid)
+    out[t > stops[-1][0]] = stops[-1][1]
+    return out
+
+
+def gradient_vector(outline_px, angle_deg=GS4_GRADIENT_ANGLE_DEG,
+                    origin_shift=GS4_GRADIENT_ORIGIN_SHIFT):
+    """Where Illustrator puts a style's linear gradient on a shape, in image
+    coordinates (y down). Takes the shape's OUTLINE POINTS.
+    Returns (origin_xy, unit_xy, length).
+
+    Illustrator fits the gradient to the shape's bounds measured in the
+    gradient's own rotated frame — not to its axis-aligned bounding box. For
+    an unrotated rectangle the two coincide, which is why rectangles alone
+    cannot tell the models apart. They diverge on the chamfered sheet,
+    because 135deg points straight at the cut top-left/bottom-right corners:
+    a 40px chamfer shortens the gradient from 1339.26 to 1282.69, confirmed
+    against Illustrator on symmetric (40px, 150px) and asymmetric octagons.
+
+    This is what places the fold, so it is load-bearing, not cosmetic:
+    fitting to the bbox instead puts it ~13px off across the sheet.
+    """
+    pts = np.asarray(outline_px, dtype=np.float64).reshape(-1, 2)
+    theta = np.deg2rad(angle_deg)
+    unit = np.array([np.cos(theta), -np.sin(theta)])  # Illustrator angles are y-up
+    perp = np.array([-unit[1], unit[0]])
+    u, v = pts @ unit, pts @ perp
+    length = float(u.max() - u.min())
+    center = (u.min() + u.max()) / 2.0 * unit + (v.min() + v.max()) / 2.0 * perp
+    origin = center - (0.5 - origin_shift) * length * unit
+    return origin, unit, length
+
+
+def gradient_opacity_map(shape_hw, outline_px, stops=GS4_GRADIENT_STOPS,
+                         angle_deg=GS4_GRADIENT_ANGLE_DEG, origin_shift=GS4_GRADIENT_ORIGIN_SHIFT):
+    h, w = shape_hw
+    origin, unit, length = gradient_vector(outline_px, angle_deg, origin_shift)
+    ys, xs = np.mgrid[0:h, 0:w] + 0.5  # pixel centres; pixel i spans [i, i+1) as in stroke_coverage_map
+    t = ((xs - origin[0]) * unit[0] + (ys - origin[1]) * unit[1]) / length
+    return gradient_opacity(t, stops)
 
 
 def composite_alpha(effective_alphas):
@@ -517,18 +758,35 @@ def compute_content_bbox(body_bbox, outlines):
     return minx, miny, maxx, maxy
 
 
-def compute_canvas_transform(content_bbox, canvas_size, margin_pct=4.0):
+# Framing, calibrated against ref_1x.jpg and ref_3x.jpg (see CLAUDE.md).
+# Unlike the gradient placement, this is a deliberate composition choice: the
+# references were framed by hand and new output has to drop into the same
+# catalogue without a visible scale or position shift. PROMPT.md's "4% margin,
+# centred" does not reproduce them, so these win.
+#
+# The long axis of the 3-sheet extent fills 92.791% of the canvas (margin
+# 3.60448% a side) and the content sits slightly down-right of centre.
+CANVAS_MARGIN_PCT = 3.60448
+CANVAS_SHIFT_PCT = (0.46219, 1.66042)
+
+
+def compute_canvas_transform(content_bbox, canvas_size, margin_pct=CANVAS_MARGIN_PCT,
+                             shift_pct=CANVAS_SHIFT_PCT):
     """Uniform scale + translate that fits content_bbox into canvas_size with
-    margin_pct of blank border on every side, content centered. Both outputs
-    must reuse the SAME transform — the whole point of framing on the
-    3-sheet extent is that the device lands identically in each file."""
+    margin_pct of blank border a side on the long axis, then nudged off-centre
+    by shift_pct of the canvas. Both outputs must reuse the SAME transform —
+    the whole point of framing on the 3-sheet extent is that the device lands
+    identically in each file.
+
+    The shift is the references' own off-centre composition, not slop: it is
+    always smaller than the margin, so content can never leave the canvas."""
     minx, miny, maxx, maxy = content_bbox
     content_w, content_h = maxx - minx, maxy - miny
     available = canvas_size * (1 - 2 * margin_pct / 100.0)
     scale = available / max(content_w, content_h)
     scaled_w, scaled_h = content_w * scale, content_h * scale
-    tx = (canvas_size - scaled_w) / 2.0 - minx * scale
-    ty = (canvas_size - scaled_h) / 2.0 - miny * scale
+    tx = (canvas_size - scaled_w) / 2.0 - minx * scale + shift_pct[0] / 100.0 * canvas_size
+    ty = (canvas_size - scaled_h) / 2.0 - miny * scale + shift_pct[1] / 100.0 * canvas_size
     return scale, tx, ty
 
 
@@ -614,17 +872,45 @@ def stroke_coverage_map(shape_hw, polylines_pts, stroke_width_px, supersample=32
     return coverage
 
 
+def fill_coverage_map(shape_hw, outline_pts, hole_pts_list=(), supersample=8):
+    """Anti-aliased area coverage in [0,1] of a polygon minus its holes, at
+    sub-pixel vertex positions (pixel i spans [i, i+1), as in
+    stroke_coverage_map). Only the outline's bbox is supersampled."""
+    h, w = shape_hw
+    pts = outline_pts.reshape(-1, 2).astype(np.float64)
+    x0 = max(0, int(np.floor(pts[:, 0].min())) - 1)
+    y0 = max(0, int(np.floor(pts[:, 1].min())) - 1)
+    x1 = min(w, int(np.ceil(pts[:, 0].max())) + 1)
+    y1 = min(h, int(np.ceil(pts[:, 1].max())) + 1)
+    coverage = np.zeros((h, w), dtype=np.float64)
+    if x1 <= x0 or y1 <= y0:
+        return coverage
+
+    def to_big(p):
+        return np.round((p.reshape(-1, 2).astype(np.float64) - [x0, y0]) * supersample).astype(np.int32).reshape(-1, 1, 2)
+
+    big = np.zeros(((y1 - y0) * supersample, (x1 - x0) * supersample), dtype=np.uint8)
+    cv2.fillPoly(big, [to_big(pts)], 255)
+    for hole in hole_pts_list:
+        cv2.fillPoly(big, [to_big(hole)], 0)
+    coverage[y0:y1, x0:x1] = cv2.resize(big, (x1 - x0, y1 - y0), interpolation=cv2.INTER_AREA) / 255.0
+    return coverage
+
+
 def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px,
-                  fill_color=(255, 255, 255), stroke_color=STROKE_COLOR_RGB,
+                  fill_color=GS4_FILL_COLOR_RGB, stroke_color=STROKE_COLOR_RGB,
                   notch_rects_px=None):
     """Draw one sheet's fill then its stroke onto canvas_f (float64 HxWx3),
     each alpha-composited over whatever is already there (previous sheets +
     device photo underneath).
 
-    Fill opacity = style_alpha * layer_alpha: Graphic Style 4's own fill
-    renders at 50% (style_alpha) independent of the object's layer opacity,
-    per the spec's opacity model — the two are kept as separate parameters
-    because layer opacity varies per product line.
+    Fill opacity = style opacity * layer_alpha. style_alpha=None uses Graphic
+    Style 4's gradient, fitted to this sheet's own outline the way applying
+    the style in Illustrator does (see gradient_vector — it is the shape's
+    extent along the gradient axis that sets it, not its bbox); a float gives
+    a flat fill at that opacity.
+    Style and layer opacity stay separate because layer opacity varies per
+    product line.
 
     Stroke opacity = layer_alpha only: nothing in the extracted Graphic
     Style 4 data reduces the stroke's own opacity, only the object/layer
@@ -636,14 +922,15 @@ def render_sheet(canvas_f, outline_px, style_alpha, layer_alpha, stroke_width_px
     hole boundary too — matching a real compound path with holes.
     """
     h, w = canvas_f.shape[:2]
-    pts = outline_px.astype(np.int32)
-    notches = [n.astype(np.int32) for n in (notch_rects_px or [])]
+    pts = outline_px.astype(np.float64)
+    notches = [n.astype(np.float64) for n in (notch_rects_px or [])]
 
-    fill_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(fill_mask, [pts], 255)
-    for notch_pts in notches:
-        cv2.fillPoly(fill_mask, [notch_pts], 0)
-    composite_layer_over(canvas_f, fill_mask > 0, fill_color, style_alpha * layer_alpha)
+    fill_coverage = fill_coverage_map((h, w), pts, notches)
+    if style_alpha is None:
+        fill_opacity = gradient_opacity_map((h, w), pts) * fill_coverage
+    else:
+        fill_opacity = fill_coverage * float(style_alpha)
+    composite_layer_over(canvas_f, fill_opacity, fill_color, layer_alpha)
 
     stroke_coverage = stroke_coverage_map((h, w), [pts] + notches, stroke_width_px)
     composite_layer_over(canvas_f, stroke_coverage, stroke_color, layer_alpha)
@@ -1050,7 +1337,7 @@ def compute_layout(result, args, notches_pct=None):
 
     outlines = sheet_outlines(base_outline, body_w, body_h, tuple(args.offset), tuple(args.step), copies)
     content_bbox = compute_content_bbox(result["body_bbox"], outlines)
-    scale, tx, ty = compute_canvas_transform(content_bbox, args.size, margin_pct=4.0)
+    scale, tx, ty = compute_canvas_transform(content_bbox, args.size)
     stroke_width_px = STROKE_WIDTH_AT_1500 * (args.size / 1500.0)
 
     base_notch_points = [notch_pct_to_points(n, result["body_bbox"]) for n in (notches_pct or [])]
@@ -1192,7 +1479,8 @@ def process_image(path: Path, args):
 
     inset_x_pct, inset_y_pct = resolve_inset_pct(args)
     result = detect_target(img, tol=args.tol, target=args.target,
-                            inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct, fit_pct=args.fit)
+                            inset_x_pct=inset_x_pct, inset_y_pct=inset_y_pct, fit_pct=args.fit,
+                            shape=args.shape)
     if result is None:
         print(f"skip {path}: no device found", file=sys.stderr)
         return {"path": path, "status": "failed", "reason": "no device found"}
@@ -1203,7 +1491,16 @@ def process_image(path: Path, args):
         return {"path": path, "status": "failed", "reason": reason}
 
     x, y, w, h = result["body_bbox"]
-    shape = "circle/ellipse" if result["is_circle"] else f"{len(result['outline'])}-point polygon"
+    info = result.get("shape_info") or {}
+    if result["is_circle"]:
+        shape = "circle/ellipse"
+    elif info.get("method") == "primitive":
+        p = info["primitive"]
+        corner = "sharp corners" if p["corner"] < 1e-6 else f"{p['kind']} {p['corner']:.2f}px"
+        shape = (f"rectangle {p['w']:.2f}x{p['h']:.2f}px, {corner}, rotation {np.rad2deg(p['theta']):.2f}deg "
+                 f"(fit: median residual {info['median_resid_px']:.2f}px)")
+    else:
+        shape = f"traced {len(result['outline'])}-point polygon"
     tol_note = f"auto tol={result['tol_used']:.1f} (border p99={result['border_p99']:.1f})" if result["tol_auto"] \
         else f"fixed tol={result['tol_used']:.1f}"
     if args.target == "body":
@@ -1216,6 +1513,9 @@ def process_image(path: Path, args):
               f"target={args.target} region {aw}x{ah}px at ({ax},{ay}); "
               f"fit {result['fit_x_px']:+.1f}x{result['fit_y_px']:+.1f}px; "
               f"protector outline: {shape}; {tol_note}")
+
+    if info.get("warning"):
+        print(f"  WARNING: {info['warning']}", file=sys.stderr)
 
     notches_pct = resolve_notches(args, img=img, result=result)
     if notches_pct:
@@ -1272,6 +1572,10 @@ def build_parser():
                     help="screen/recess only: signed %% of the detected active region's own "
                          "width/height. Positive dilates outward (bleed past a screen onto "
                          "the bezel); negative erodes inward (contract to fit inside a recess)")
+    p.add_argument("--shape", choices=["primitive", "trace"], default="primitive",
+                    help="primitive: fit a rectangle with one shared chamfer/radius and generate the "
+                         "protector from its parameters (falls back to trace with a warning if the "
+                         "device isn't that shape); trace: follow the detected contour")
     p.add_argument("--profile", type=Path, default=None)
     p.add_argument("--notch", nargs=4, type=float, action="append", default=None)
     p.add_argument("--pick", action="store_true")
@@ -1285,7 +1589,8 @@ def build_parser():
     p.add_argument("--inset-y", type=float, default=1.441, help="%% of body height")
     p.add_argument("--offset", nargs=2, type=float, default=[7.901, 14.697])
     p.add_argument("--step", nargs=2, type=float, default=[2.75, 8.2])
-    p.add_argument("--style-alpha", type=float, default=0.50)
+    p.add_argument("--style-alpha", type=float, default=None,
+                    help="flat fill opacity override; default renders Graphic Style 4's gradient")
     p.add_argument("--layer-alpha", nargs="+", type=float, default=None)
     p.add_argument("--tol", type=float, default=None,
                     help="background detection tolerance; default is auto "

@@ -12,6 +12,9 @@ CLEAN_DEVICE = Path(__file__).parent / "input" / "test_clean_device.png"
 # Measured directly from ref_1x.jpg (not from the .ai file, per spec: rendered reference wins).
 TRUE_BODY_BBOX = (61, 325, 1234, 694)  # x, y, w, h
 TRUE_SHEET_EDGES = (166, 437, 1385, 1112)  # left, top, right, bottom, from stroke pixels
+# The device body in ref_1x.jpg / ref_3x.jpg — both references frame it on the
+# identical pixel, which is what the framing calibration has to reproduce.
+REFERENCE_BODY_LTRB = (61, 325, 1295, 1019)
 # 8.5 / 16.1 from PROMPT.md's rounded measurement does not match ref_1x.jpg's
 # actual stroke pixels. Solved directly from clean pixel measurements of body
 # edges (61,325)-(1295,1019) and sheet edges (166,437)-(1385,1111), each
@@ -103,6 +106,99 @@ def test_protector_outline_matches_reference_sheet():
     assert abs(top - t_top) <= 2, f"top edge off by {top - t_top:.1f}px"
     assert abs(right - t_right) <= 2, f"right edge off by {right - t_right:.1f}px"
     assert abs(bottom - t_bottom) <= 2, f"bottom edge off by {bottom - t_bottom:.1f}px"
+
+
+# --- Parametric primitive fit -------------------------------------------------
+
+def _render_primitive_photo(prim, size=(900, 1200), supersample=8, blur_sigma=0.7):
+    """Anti-aliased dark primitive on white, like a product photo."""
+    h, w = size
+    cov = ss.fill_coverage_map((h, w), ss.primitive_points(prim, arc_segments=90), supersample=supersample)
+    img = np.clip(255.0 * (1.0 - cov) + 20.0 * cov, 0, 255).astype(np.uint8)
+    img = cv2.GaussianBlur(img, (5, 5), blur_sigma)
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+
+def _fit_from_photo(img, shape="primitive", inset=(0.0, 0.0)):
+    bg = ss.sample_background_color(img)
+    mask = ss.device_mask(img, bg, 110)
+    contour = ss.largest_external_contour(mask, chain=cv2.CHAIN_APPROX_NONE)
+    return ss.derive_outline(contour, mask.shape[:2], inset[0], inset[1], shape)
+
+
+# A thresholded binary mask can't place an edge finer than half a pixel either
+# way, so w/h tolerances are 1px (two edges) — tighter would test the mask, not the fit.
+
+def test_primitive_fit_recovers_rotated_chamfered_rectangle():
+    truth = {"kind": "chamfer", "cx": 600.3, "cy": 450.7, "w": 801.4, "h": 452.6,
+             "theta": np.deg2rad(4.0), "corner": 37.2}
+    _, _, info = _fit_from_photo(_render_primitive_photo(truth))
+    assert info["method"] == "primitive"
+    p = info["primitive"]
+    assert p["kind"] == "chamfer"
+    for key, tol in (("cx", 0.5), ("cy", 0.5), ("w", 1.0), ("h", 1.0), ("corner", 1.0)):
+        assert abs(p[key] - truth[key]) <= tol, f"{key}: {p[key]:.2f} vs {truth[key]}"
+    assert abs(np.rad2deg(p["theta"] - truth["theta"])) <= 0.03
+
+
+def test_primitive_fit_recovers_rounded_rectangle():
+    truth = {"kind": "round", "cx": 590.0, "cy": 440.5, "w": 640.0, "h": 700.0,
+             "theta": 0.0, "corner": 85.0}
+    _, _, info = _fit_from_photo(_render_primitive_photo(truth))
+    p = info["primitive"]
+    assert info["method"] == "primitive" and p["kind"] == "round"
+    assert abs(p["w"] - truth["w"]) <= 1.0 and abs(p["h"] - truth["h"]) <= 1.0
+    assert abs(p["corner"] - truth["corner"]) <= 1.0
+    assert p["theta"] == 0.0
+
+
+def test_primitive_outline_is_exact_geometry():
+    """Generated from parameters: straight axis-aligned sides, four identical
+    45-degree chamfers — no contour noise can survive into it."""
+    img = cv2.imread(str(CLEAN_DEVICE))
+    result = ss.detect_body(img, tol=None, inset_x_pct=DEFAULT_INSET_X_PCT, inset_y_pct=DEFAULT_INSET_Y_PCT)
+    info = result["shape_info"]
+    assert info["method"] == "primitive" and info["primitive"]["kind"] == "chamfer"
+    assert info["primitive"]["theta"] == 0.0, "sub-pixel tilt must snap to 0"
+
+    pts = result["outline"].reshape(-1, 2).astype(np.float64)
+    assert len(pts) == 8
+    edges = np.roll(pts, -1, axis=0) - pts
+    lengths = np.hypot(edges[:, 0], edges[:, 1])
+    chamfers, sides = lengths[0::2], edges[1::2]  # outline alternates chamfer, side
+    assert np.all(np.min(np.abs(sides), axis=1) < 1e-3), "sides must be exactly axis-aligned"
+    assert np.ptp(chamfers) < 1e-3, "all four chamfers must be identical"
+    assert np.allclose(np.abs(edges[0::2, 0]), np.abs(edges[0::2, 1]), atol=1e-3), "chamfers must be 45 degrees"
+
+
+def test_offset_primitive_matches_true_anisotropic_erosion():
+    """The analytic inset must equal eroding the real shape by the same
+    elliptical kernel (the calibrated --inset-x/--inset-y model), for both
+    corner kinds."""
+    for kind, corner in (("chamfer", 40.0), ("round", 60.0)):
+        base = {"kind": kind, "cx": 600.0, "cy": 450.0, "w": 800.0, "h": 500.0, "theta": 0.0, "corner": corner}
+        img = _render_primitive_photo(base, blur_sigma=0.01)
+        _, _, eroded_info = _fit_from_photo(img, inset=(7.0, 12.0))
+        # derive_outline offsets the fitted primitive analytically; compare against
+        # fitting the mask that was actually eroded with the elliptical kernel
+        bg = ss.sample_background_color(img)
+        mask = ss.device_mask(img, bg, 110)
+        eroded = ss.offset_filled_mask(mask, 7.0, 12.0)
+        contour = ss.largest_external_contour(eroded, chain=cv2.CHAIN_APPROX_NONE)
+        measured, _ = ss.fit_best_primitive(contour)
+        analytic = eroded_info["primitive"]
+        assert measured["kind"] == kind
+        for key in ("w", "h", "corner"):
+            assert abs(analytic[key] - measured[key]) <= 1.0, f"{kind} {key}: {analytic[key]:.2f} vs {measured[key]:.2f}"
+
+
+def test_non_rectangular_shape_falls_back_to_trace_with_warning():
+    canvas = np.full((900, 1200, 3), 255, dtype=np.uint8)
+    pts = np.array([[200, 200], [1000, 200], [1000, 700], [650, 700], [650, 450], [200, 450]], np.int32)
+    cv2.fillPoly(canvas, [pts], (20, 20, 20))  # L-shaped body
+    outline, _, info = _fit_from_photo(canvas)
+    assert info["method"] == "trace" and info["warning"]
+    assert outline is not None
 
 
 def _synthetic_light_grey_device(diff_from_white=33, blur_sigma=0.8):
@@ -237,21 +333,361 @@ def test_canvas_transform_frames_three_sheet_extent_identically():
         body_w=400, body_h=300, offset_pct=(8, 15), step_pct=(3, 8), copies=3,
     )
     content_bbox = ss.compute_content_bbox(body_bbox, outlines)
-    scale, tx, ty = ss.compute_canvas_transform(content_bbox, canvas_size=1500, margin_pct=4.0)
+    scale, tx, ty = ss.compute_canvas_transform(content_bbox, canvas_size=1500)
 
-    # sanity: transformed content bbox sits within canvas bounds with ~4% margin
     minx, miny, maxx, maxy = content_bbox
-    left = minx * scale + tx
-    top = miny * scale + ty
-    right = maxx * scale + tx
-    bottom = maxy * scale + ty
+    left, top = minx * scale + tx, miny * scale + ty
+    right, bottom = maxx * scale + tx, maxy * scale + ty
     assert left >= 0 and top >= 0 and right <= 1500 and bottom <= 1500
-    # content is wider than tall, so width hits the ~4% margin tightly on
-    # both sides; height (uniformly scaled, then centered) gets more margin
-    # — that's correct aspect-preserving fit, not a bug.
-    assert abs(left - 1500 * 0.04) < 1500 * 0.01
-    assert abs((1500 - right) - 1500 * 0.04) < 1500 * 0.01
-    assert top > 1500 * 0.04 and (1500 - bottom) > 1500 * 0.04
+    # Content is wider than tall, so width takes the margin tightly on both
+    # sides; height (uniformly scaled) gets more — correct aspect-preserving
+    # fit, not a bug. Both axes then sit shifted down-right of centre by the
+    # references' own composition offset.
+    m, (sx_pct, sy_pct) = ss.CANVAS_MARGIN_PCT / 100.0, ss.CANVAS_SHIFT_PCT
+    assert abs(left - 1500 * (m + sx_pct / 100.0)) < 1.0
+    assert abs((1500 - right) - 1500 * (m - sx_pct / 100.0)) < 1.0
+    assert top > 1500 * m and (1500 - bottom) > 1500 * m
+
+
+def test_canvas_shift_can_never_push_content_off_canvas():
+    """The off-centre nudge is a composition offset, not slop — it is smaller
+    than the margin on both axes, so the worst case (content square enough
+    that both axes bind) still leaves a positive margin all round."""
+    assert 0 <= ss.CANVAS_SHIFT_PCT[0] < ss.CANVAS_MARGIN_PCT
+    assert 0 <= ss.CANVAS_SHIFT_PCT[1] < ss.CANVAS_MARGIN_PCT
+    for w, h in [(1000, 1000), (1000, 300), (300, 1000), (1234, 694)]:
+        scale, tx, ty = ss.compute_canvas_transform((0, 0, w, h), canvas_size=1500)
+        assert 0 < tx and 0 < ty
+        assert w * scale + tx < 1500 and h * scale + ty < 1500
+
+
+def test_framing_reproduces_the_reference_layout():
+    """Framing is a deliberate composition choice (unlike the gradient
+    placement), so new output has to land on the existing catalogue: running
+    the clean device through must put its body exactly where ref_1x.jpg has
+    it, at the same scale.
+
+    Calibrated so that re-feeding a reference render is the identity — the
+    3-sheet extent's long axis fills 92.791% of the canvas, then shifted
+    down-right off centre. ref_3x.jpg is what proves the basis is the 3-SHEET
+    extent and not the 1-sheet one: it carries far more content than ref_1x
+    yet places the device on the very same pixel.
+    """
+    img = cv2.imread(str(CLEAN_DEVICE))
+    args = ss.build_parser().parse_args([str(CLEAN_DEVICE)])
+    tol, _confident, _border_p99 = ss.auto_tol(img, ss.sample_background_color(img))
+    result = ss.detect_body(img, tol, args.inset_x, args.inset_y, shape=args.shape)
+    layout = ss.compute_layout(result, args)
+    scale, tx, ty = layout["scale"], layout["tx"], layout["ty"]
+
+    bx, by, bw, bh = result["body_bbox"]
+    assert (bw, bh) == (1234, 694)
+    got = (bx * scale + tx, by * scale + ty, (bx + bw) * scale + tx, (by + bh) * scale + ty)
+    for got_edge, want_edge in zip(got, REFERENCE_BODY_LTRB):
+        assert abs(got_edge - want_edge) <= 1.0, (got, REFERENCE_BODY_LTRB)
+
+
+# --- Graphic Style 4: gradient fill and stroke -------------------------------
+
+# Exported by Illustrator 26.0.1 from screenshield-gs.ai converted to an RGB
+# document: K0 black backdrop, one 1219x675pt rectangle at (40,40) with
+# Graphic Style 4 applied, PNG24 at 72ppi (1pt = 1px).
+ILLUSTRATOR_GS4_RENDER = Path(__file__).parent / "illustrator_gs4_render.png"
+ILLUSTRATOR_SHEET_LTRB = (40, 40, 1259, 715)
+
+# Same document and export settings, but a CHAMFERED octagon (asymmetric legs
+# 30/45/50/35 on the same 1219x675 bbox) — the shape that distinguishes
+# fitting the gradient to the bounding box from fitting it to the shape's
+# extent along the gradient axis. Stroke removed so the fold is unobstructed.
+ILLUSTRATOR_GS4_OCTAGON = Path(__file__).parent / "illustrator_gs4_octagon.png"
+ILLUSTRATOR_OCTAGON = (40, 40, 1219, 675)  # left, top, width, height (image coords)
+
+
+def test_gs4_gradient_opacity_profile():
+    t = np.array([-0.2, 0.0, 0.5, 0.5637, 0.6209, 0.6781, 0.6795, 0.9, 1.2])
+    got = ss.gradient_opacity(t)
+    expected = [0.5, 0.5, 0.5, 0.5, 0.45, 0.4, 0.6, 0.6, 0.6]
+    assert np.allclose(got, expected, atol=0.002)
+
+
+def test_gradient_midpoint_curve_matches_illustrator():
+    """Sampled from Illustrator renders of a 0->100% opacity ramp with the
+    midpoint moved to 13 and to 80."""
+    s = np.array([0.1, 0.25, 0.5, 0.75, 0.9])
+    assert np.allclose(ss.gradient_midpoint_curve(s, 0.5), s)
+    assert np.allclose(ss.gradient_midpoint_curve(s, 0.13), [0.412, 0.761, 0.969, 1.0, 1.0], atol=0.01)
+    assert np.allclose(ss.gradient_midpoint_curve(s, 0.80), [0.000, 0.012, 0.118, 0.408, 0.725], atol=0.01)
+
+
+def _rect_pts(l, t, r, b):
+    return np.array([[l, t], [r, t], [r, b], [l, b]], dtype=np.float64)
+
+
+def _octagon_pts(l, t, w, h, k_tl, k_tr, k_br, k_bl):
+    """Chamfered rectangle in image coordinates (y down), clockwise."""
+    r, b = l + w, t + h
+    return np.array([[l + k_tl, t], [r - k_tr, t], [r, t + k_tr], [r, b - k_br],
+                     [r - k_br, b], [l + k_bl, b], [l, b - k_bl], [l, t + k_tl]],
+                    dtype=np.float64)
+
+
+def test_gradient_vector_matches_illustrator_style_apply():
+    """GradientColor.origin/length Illustrator reported after applying Graphic
+    Style 4, for rectangles AND chamfered octagons. Illustrator coordinates are
+    y-up and it reports origin rounded to whole units.
+
+    The octagon cases are the ones that pin the behaviour down: rectangles
+    alone cannot, because an unrotated rectangle's bounding box and its extent
+    along the 135deg axis are the same number.
+    """
+    # Shape geometry in image coordinates (y down); Illustrator reports the
+    # origin in its own y-up frame, so that one value is compared flipped.
+    cases = [  # points (image coords), reported origin (y-up), reported length
+        (_rect_pts(499.301472240226, 50, 1718.30147224023, 725), (1537, -816), 1339.26024356732),
+        (_rect_pts(504.301472240226, 60, 1179.30147224023, 1279), (1270, -1098), 1339.26024356732),
+        (_rect_pts(509.301472240226, 70, 1309.30147224023, 870), (1271, -832), 1131.37084989848),
+        (_rect_pts(514.301472240226, 80, 614.301472240226, 130), (598, -138), 106.066017177982),
+        # same 1219x675 bbox, three different chamferings -> three lengths
+        (_octagon_pts(100, 3000, 1219, 675, 40, 40, 40, 40), (1119, -3747), 1282.691701),
+        (_octagon_pts(100, 4000, 1219, 675, 150, 150, 150, 150), (1070, -4698), 1127.128209),
+        (_octagon_pts(40, 40, 1219, 675, 30, 45, 50, 35), (1052, -785), 1282.691701),
+    ]
+    for pts, (ox, oy), length in cases:
+        origin, unit, got_length = ss.gradient_vector(pts)
+        assert abs(got_length - length) < 1e-5, (length, got_length)
+        assert abs(origin[0] - ox) <= 1.0 and abs(-origin[1] - oy) <= 1.0
+
+
+def test_chamfer_shrinks_with_the_inset_like_offset_path():
+    """Settled: the chamfer shrinks with the inset, the way Illustrator's
+    Object > Path > Offset Path (miter join) shrinks it — the reference's own
+    corners measure 39.5/41.7/44.4px, which is hand-drawn variance, not a spec
+    to be reproduced.
+
+    Numbers below are Illustrator's own Offset Path output on an 800x500
+    octagon with 60px legs, read back off the expanded path.
+    """
+    for offset, want_leg in [(7.5, 55.6064), (10.0, 54.1421), (20.0, 48.2842)]:
+        prim = {"kind": "chamfer", "cx": 500.0, "cy": 350.0,
+                "w": 800.0, "h": 500.0, "theta": 0.0, "corner": 60.0}
+        got = ss.offset_primitive(prim, offset, offset)
+        assert abs(got["corner"] - want_leg) < 1e-3, (offset, got["corner"], want_leg)
+        assert abs(got["w"] - (800.0 - 2 * offset)) < 1e-9
+        assert abs(got["h"] - (500.0 - 2 * offset)) < 1e-9
+
+    # the production inset is anisotropic, which Offset Path cannot express;
+    # the elliptical generalisation must still reduce to it when dx == dy
+    iso = ss.offset_primitive({"kind": "chamfer", "cx": 0, "cy": 0, "w": 800.0,
+                               "h": 500.0, "theta": 0.0, "corner": 60.0}, 8.75, 8.75)
+    assert abs(iso["corner"] - (60.0 + 8.75 * (np.sqrt(2) - 2))) < 1e-9
+
+
+def test_chamfer_shrink_feeds_the_fold_position():
+    """The chamfer is not cosmetic any more: gradient length is
+    (W + H - k_tl - k_br)/sqrt(2), so shrinking the chamfer with the inset
+    lengthens the gradient and moves the fold. On the reference sheet, keeping
+    the body's 44px chamfer instead of the shrunk 39px moves the fold by 2.26
+    along x+y — 1.6px across the sheet, i.e. further than the fold's own 1.1px
+    width, so it is a visible displacement. The two decisions are coupled and
+    must not be changed independently."""
+    body = {"kind": "chamfer", "cx": 678.0, "cy": 672.0, "w": 1234.0, "h": 694.0,
+            "theta": 0.0, "corner": 44.0}
+    shrunk = ss.offset_primitive(body, 7.5, 10.0)
+    assert abs(shrunk["corner"] - 39.0) < 1e-6  # 44 + hypot(7.5,10) - 7.5 - 10
+
+    def fold_xy(prim):
+        pts = ss.primitive_points(prim).reshape(-1, 2)
+        origin, unit, length = ss.gradient_vector(pts)
+        p = origin + FOLD_T * length * unit
+        return p[0] + p[1]
+
+    unshrunk = dict(shrunk, corner=body["corner"])  # same sheet, body's chamfer kept
+    moved = abs(fold_xy(shrunk) - fold_xy(unshrunk))
+    fold_width_xy = (ss.GS4_GRADIENT_STOPS[2][0] - ss.GS4_GRADIENT_STOPS[1][0]) * 1284 * np.sqrt(2)
+    assert moved > fold_width_xy > 0
+    assert abs(moved - 2.26) < 0.05
+
+
+def test_sheet_steps_are_uniform():
+    """Settled: sheet-to-sheet steps stay uniform. ref_3x.jpg's own steps are
+    uneven — (+33.5,+58.5) then (+35.0,+55.2) — but that is hand-placement
+    jitter, not intent; the default step (2.75%, 8.2%) = (33.9, 56.9) is their
+    average to within 0.3px. The fold positions confirm the sheets really are
+    just copies: they track the sheets at 92.0 and 90.4 along x+y."""
+    base = np.array([[0, 0], [400, 0], [400, 300], [0, 300]], dtype=np.float64).reshape(-1, 1, 2)
+    outlines = ss.sheet_outlines(base, body_w=400, body_h=300,
+                                 offset_pct=(8, 15), step_pct=(3, 8), copies=4)
+    steps = [np.array(ss.outline_bounds(b)[:2]) - np.array(ss.outline_bounds(a)[:2])
+             for a, b in zip(outlines, outlines[1:])]
+    for step in steps[1:]:
+        assert np.allclose(step, steps[0], atol=1e-9)
+    assert np.allclose(steps[0], [400 * 0.03, 300 * 0.08])
+
+
+def test_gradient_fits_shape_extent_not_bounding_box():
+    """Illustrator fits the gradient to the shape's extent ALONG THE GRADIENT
+    AXIS, not to its bounding box, and 135deg points straight at the chamfered
+    corners. Same bbox, different chamfer -> different gradient length, exactly
+    (W + H - k_tl - k_br) / sqrt(2). Only the two corners on the axis matter.
+
+    This is what puts the fold in the right place; fitting to the bbox instead
+    misplaces it by ~13px across the reference sheet.
+    """
+    w, h = 1219, 675
+    rect_len = (w + h) / np.sqrt(2)
+    _, _, got = ss.gradient_vector(_rect_pts(0, 0, w, h))
+    assert abs(got - rect_len) < 1e-9
+
+    for k_tl, k_br in [(40, 40), (30, 50), (150, 150), (0, 60)]:
+        pts = _octagon_pts(0, 0, w, h, k_tl, 45, k_br, 35)
+        _, _, got = ss.gradient_vector(pts)
+        assert abs(got - (w + h - k_tl - k_br) / np.sqrt(2)) < 1e-9
+        assert got < rect_len if (k_tl or k_br) else True
+
+    # the off-axis corners must not matter at all
+    a = ss.gradient_vector(_octagon_pts(0, 0, w, h, 40, 10, 40, 10))[2]
+    b = ss.gradient_vector(_octagon_pts(0, 0, w, h, 40, 200, 40, 180))[2]
+    assert abs(a - b) < 1e-9
+
+
+def test_render_sheet_gradient_matches_illustrator_export():
+    ai = cv2.imread(str(ILLUSTRATOR_GS4_RENDER)).astype(np.float64).mean(axis=2)
+    h, w = ai.shape
+    l, t, r, b = ILLUSTRATOR_SHEET_LTRB
+    canvas = np.zeros((h, w, 3), dtype=np.float64)
+    outline = np.array([[l, t], [r, t], [r, b], [l, b]], dtype=np.float64).reshape(-1, 1, 2)
+    ss.render_sheet(canvas, outline, None, 1.0, stroke_width_px=0)
+    ours = canvas.mean(axis=2)
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    interior = (xx >= l + 4) & (xx < r - 4) & (yy >= t + 4) & (yy < b - 4)
+    # the 0.4->0.6 step lands within half a pixel of Illustrator's; away from it, per-pixel parity
+    away_from_step = interior & (np.abs(xx + yy - 599) > 3)
+    assert np.abs(ours - ai)[away_from_step].max() <= 1.0
+
+    def step_position(img):
+        found = []
+        for y in range(60, 500, 10):
+            row = img[y, l + 2:r - 2] / 255.0
+            i = int(np.argmin(np.diff(row)))
+            v, xs = row[i - 2:i + 4], np.arange(l + i, l + i + 6) + 0.5
+            k = np.where((v[:-1] >= 0.5) & (v[1:] < 0.5))[0][0]
+            found.append(xs[k] + (v[k] - 0.5) / (v[k] - v[k + 1]) + y + 0.5)
+        return np.median(found)
+
+    assert abs(step_position(ours) - step_position(ai)) <= 1.0
+
+
+FOLD_T = (ss.GS4_GRADIENT_STOPS[1][0] + ss.GS4_GRADIENT_STOPS[2][0]) / 2
+# Where ref_1x.jpg's fold actually is, measured off the pixels two independent
+# ways: the mean brightness drop per x+y diagonal over the device bottoms out
+# at x+y = 1140.3-1140.5, and extrapolating the 50%->40% bezel ramp (6051 px,
+# rms 0.0024) puts it at 1142.8.
+REFERENCE_FOLD_XY = 1140.4
+
+
+def test_fold_lands_where_the_reference_puts_it():
+    """The 40%->60% hard stop is the peel's fold line, so its position is the
+    visible design feature, not an implementation detail.
+
+    Fitting the gradient to the sheet's bbox puts the fold at x+y = 1121.8 —
+    ~19 along the diagonal, ~13px across the sheet, from where the reference
+    has it. Fitting to the shape's extent along the gradient axis (what
+    Illustrator actually does) puts it at 1139.5, on top of the reference.
+    """
+    l, t, r, b = TRUE_SHEET_EDGES
+    chamfered = _octagon_pts(l, t, r - l, b - t, 39.1, 39.1, 39.1, 39.1)
+    origin, unit, length = ss.gradient_vector(chamfered)
+    fold = origin + FOLD_T * length * unit
+    assert abs((fold[0] + fold[1]) - REFERENCE_FOLD_XY) <= 2.0
+
+    bbox_origin, bbox_unit, bbox_length = ss.gradient_vector(_rect_pts(l, t, r, b))
+    bbox_fold = bbox_origin + FOLD_T * bbox_length * bbox_unit
+    assert abs((bbox_fold[0] + bbox_fold[1]) - REFERENCE_FOLD_XY) > 15.0
+
+
+def test_fold_renders_as_a_hard_edge_not_a_blur():
+    """Against Illustrator's own export of a chamfered octagon with Graphic
+    Style 4. The fold must stay a hard edge: the two gradient stops sit
+    0.0863% of the gradient length apart (1.1px across the sheet), so the
+    transition is ~2 diagonals wide, not a soft ramp.
+
+    Illustrator spreads it over 3 diagonals of its own antialiasing; ours
+    point-samples the gradient at pixel centres and resolves it in 2, so ours
+    is marginally the sharper of the two. Both are straight: the gradient is
+    constant along x+y, so every pixel on a diagonal gets the same value and
+    the edge has no staircase.
+    """
+    ai = cv2.imread(str(ILLUSTRATOR_GS4_OCTAGON)).astype(np.float64).mean(axis=2)
+    h, w = ai.shape
+    pts = _octagon_pts(*ILLUSTRATOR_OCTAGON, 30, 45, 50, 35).reshape(-1, 1, 2)
+    canvas = np.zeros((h, w, 3), dtype=np.float64)
+    ss.render_sheet(canvas, pts, None, 1.0, stroke_width_px=0)
+    ours = canvas.mean(axis=2)
+
+    ys, xs = np.mgrid[0:h, 0:w]
+    s = xs + ys
+    # well inside the octagon — measured from the polygon itself, so the
+    # diagonal chamfer edges are excluded too, not just the axis-aligned ones
+    filled = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(filled, [pts.reshape(-1, 2).astype(np.int32)], 255)
+    interior = cv2.distanceTransform(filled, cv2.DIST_L2, 5) >= 6.0
+
+    def profile(img):
+        return {k: img[interior & (s == k)].mean() / 255.0
+                for k in range(560, 660) if (interior & (s == k)).sum() >= 40}
+
+    p_ai, p_ours = profile(ai), profile(ours)
+
+    def midpoint(p):  # geometric x+y: pixel (x,y) centre sits at x+y+1
+        ks = sorted(p)
+        for k0, k1 in zip(ks, ks[1:]):
+            if p[k0] >= 0.5 > p[k1]:
+                return k0 + (p[k0] - 0.5) / (p[k0] - p[k1]) + 1.0
+        raise AssertionError("no fold found")
+
+    assert abs(midpoint(p_ours) - midpoint(p_ai)) <= 1.0
+
+    def transition_width(p):
+        """Diagonals strictly between the 60% plateau and the 40% floor. Only
+        the step itself — past it the gradient ramps back up toward 50%, which
+        re-enters the same value band and is not part of the fold."""
+        ks = sorted(p)
+        last_high = max(k for k in ks if p[k] >= 0.595)
+        first_low = min(k for k in ks if k > last_high and p[k] <= 0.405)
+        return first_low - last_high - 1
+
+    assert transition_width(p_ours) <= transition_width(p_ai)
+    assert transition_width(p_ours) <= 3
+
+    # away from the fold the two renders agree per-pixel
+    away = interior & (np.abs(s - 606) > 3)
+    assert np.abs(ours - ai)[away].max() <= 1.5
+
+
+def test_reference_shows_gradient_dip_not_flat_fill():
+    """ref_1x.jpg's bottom bezel (pure black, level 1) under sheet 1 dips to
+    ~0.40 and ramps back to 0.50 — a flat 0.50 fill misses by up to 0.1."""
+    img = cv2.imread(str(REF_1X)).astype(np.float64).mean(axis=2)
+    canvas = np.zeros((1500, 1500, 3), dtype=np.float64)
+    l, t, r, b = TRUE_SHEET_EDGES
+    outline = np.array([[l, t], [r, t], [r, b], [l, b]], dtype=np.float64).reshape(-1, 1, 2)
+    ss.render_sheet(canvas, outline, None, 1.0, stroke_width_px=0)
+
+    for x, y in [(190, 985), (260, 985), (330, 985), (600, 985), (1200, 985)]:
+        measured = (np.median(img[y - 2:y + 3, x - 2:x + 3]) - 1.0) / 254.0
+        assert abs(measured - canvas[y, x, 0] / 255.0) <= 0.015
+    assert (np.median(img[983:988, 188:193]) - 1.0) / 254.0 < 0.43
+
+
+def test_stroke_colour_admits_reference_darkest_pixels():
+    """A stroke can't make a pixel darker than its own colour. ref_1x.jpg's
+    sheet chamfers (over white) contain pixels near 116-125, which rules out
+    any stroke colour much lighter than Illustrator's 120."""
+    img = cv2.imread(str(REF_1X)).astype(np.float64).mean(axis=2)
+    darkest = min(img[1066:1118, 1340:1392].min(), img[1066:1118, 160:212].min())
+    assert darkest < 130
+    assert ss.STROKE_COLOR_RGB[0] <= darkest + 10
 
 
 # --- Stage 3: cutouts / notches ---------------------------------------------
